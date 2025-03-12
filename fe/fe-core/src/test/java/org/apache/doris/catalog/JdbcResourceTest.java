@@ -178,6 +178,13 @@ public class JdbcResourceTest {
     }
 
     @Test
+    public void testHandleJdbcUrlForKingbase() throws DdlException {
+        String inputUrl = "jdbc:kingbase8://127.0.0.1:5432/test";
+        String resultUrl = JdbcResource.handleJdbcUrl(inputUrl);
+        Assert.assertEquals(inputUrl, resultUrl);
+    }
+
+    @Test
     public void testHandleJdbcUrlForSqlServerWithoutParams() throws DdlException {
         String inputUrl = "jdbc:sqlserver://127.0.0.1:1433;databaseName=doris_test";
         String resultUrl = JdbcResource.handleJdbcUrl(inputUrl);
