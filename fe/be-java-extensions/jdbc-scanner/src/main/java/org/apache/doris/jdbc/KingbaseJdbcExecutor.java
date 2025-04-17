@@ -39,7 +39,7 @@ public class KingbaseJdbcExecutor extends BaseJdbcExecutor {
                                    VectorTable outputTable) {
         for (int i = 0; i < columnCount; ++i) {
             if (outputTable.getColumnType(i).getType() == Type.DATETIME
-                || outputTable.getColumnType(i).getType() == Type.DATETIMEV2) {
+                    || outputTable.getColumnType(i).getType() == Type.DATETIMEV2) {
                 block.add(new Object[batchSizeNum]);
             } else if (outputTable.getColumnType(i).getType() == Type.STRING) {
                 block.add(new Object[batchSizeNum]);
