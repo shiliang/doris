@@ -77,7 +77,7 @@ public class JdbcResource extends Resource {
     public static final String JDBC_OCEANBASE = "jdbc:oceanbase";
     public static final String JDBC_DB2 = "jdbc:db2";
     public static final String JDBC_GBASE = "jdbc:gbase";
-    public static final String JDBC_KINGBASE = "jdbc:kingbase";
+    public static final String JDBC_KINGBASE = "jdbc:kingbase8";
 
     public static final String MYSQL = "MYSQL";
     public static final String POSTGRESQL = "POSTGRESQL";
