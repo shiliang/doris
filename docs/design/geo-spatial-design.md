@@ -62,87 +62,277 @@ flowchart TB
 
 ## 2. Frontend 实现
 
-### 2.1 类型系统
+FE 不负责几何解析与空间计算，只做三件事：**函数注册**、**类型检查（几何一律当 VARCHAR）**、**把 `ST_*` 下推到 BE 执行**。下面用 SQL 说明用户侧该怎么写、FE 侧实际发生了什么。
 
-Doris FE **没有** `GEOMETRY` / `GEOGRAPHY` 原生列类型：
+### 2.1 类型系统：没有 GEOMETRY，用 VARCHAR 存几何
 
-- `fe/fe-type/.../Type.java` 与 `PrimitiveType.java` 中均无 GEOMETRY 枚举。
-- `DorisParser.g4` 语法文件中无 `GEOMETRY` 类型关键字，`CREATE TABLE ... GEOMETRY` 不被原生支持。
-- 几何输入/输出在函数签名中统一映射为 `VarcharType.SYSTEM_DEFAULT`。
-
-MySQL 协议层保留了兼容定义：
-
-```java
-// fe/fe-type/.../MysqlColType.java
-MYSQL_TYPE_GEOMETRY(255, "GEOMETRY", "GEOMETRY")
-```
-
-该定义仅用于 MySQL wire protocol 兼容，不代表 Doris 内部支持 GEOMETRY 列类型。
-
-**推荐用法**：使用 `VARCHAR` 列存储经 `ST_Point`、`ST_GeomFromText` 等函数编码后的二进制 blob。
+Doris FE **没有** `GEOMETRY` / `GEOGRAPHY` 原生列类型（`Type.java` / `PrimitiveType.java` 无枚举，`DorisParser.g4` 也无该关键字）。因此下面这种建表会失败：
 
 ```sql
-CREATE TABLE geo_table (
+-- ❌ 不支持：无法声明 GEOMETRY 列
+CREATE TABLE geo_bad (
     id INT,
-    location VARCHAR(512),   -- 存储 ST_Point 编码结果
-    region   VARCHAR(4096)   -- 存储 ST_GeomFromText 编码结果
+    location GEOMETRY
 );
 ```
 
-### 2.2 函数注册
+正确做法是用 `VARCHAR`/`STRING` 存 Doris 自定义二进制编码（由 `ST_Point`、`ST_GeomFromText` 等函数写出）：
 
-所有 Geo 函数在 `BuiltinScalarFunctions.java` 中注册，对应 Nereids 表达式类位于：
+```sql
+-- ✅ 推荐：VARCHAR 承载几何 blob
+CREATE TABLE geo_table (
+    id       INT,
+    lng      DOUBLE,
+    lat      DOUBLE,
+    location VARCHAR(512),    -- 存点：ST_Point 的返回值
+    region   VARCHAR(4096)    -- 存面：ST_GeomFromText 的返回值
+)
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 1
+PROPERTIES ("replication_num" = "1");
+
+-- 写入：先用构造函数生成编码，再 INSERT 进 VARCHAR 列
+INSERT INTO geo_table VALUES
+    (1, 116.40, 39.90,
+     ST_Point(116.40, 39.90),
+     ST_GeomFromText('POLYGON ((116.3 39.8, 116.5 39.8, 116.5 40.0, 116.3 40.0, 116.3 39.8))'));
+
+-- 读出：用 ST_AsText 把 blob 还原成可读 WKT（直接 SELECT location 看到的是二进制）
+SELECT id, ST_AsText(location), ST_AsText(region) FROM geo_table;
+```
+
+MySQL 协议里虽有 `MYSQL_TYPE_GEOMETRY(255)`（`MysqlColType.java`），仅用于 wire 兼容，**不代表** Doris 内部有 GEOMETRY 列类型。
+
+### 2.2 函数注册：签名在 SQL 里长什么样
+
+所有 Geo 函数在 `BuiltinScalarFunctions.java` 注册，Nereids 表达式类在：
 
 ```
 fe/fe-core/src/main/java/org/apache/doris/nereids/trees/expressions/functions/scalar/St*.java
 ```
 
-每个 `St*` 类遵循统一模式：
+每个 `St*` 实现 `ExplicitlyCastableSignature` + `AlwaysNullable`（参数为 NULL 则返回 NULL）。对用户而言，签名规则可以概括为：
 
-- 实现 `ExplicitlyCastableSignature`，声明参数与返回类型。
-- 实现 `AlwaysNullable`（输入为 NULL 时返回 NULL）。
-- 通过 `ScalarFunctionVisitor` 提供 `visitSt*` 访问方法。
-- 多数类由 `GenerateFunction` 工具自动生成。
+| 函数类别 | SQL 示例 | 参数类型（FE 视角） | 返回类型 |
+|----------|----------|---------------------|----------|
+| 构造 | `ST_Point(116.4, 39.9)` | `DOUBLE, DOUBLE` | `VARCHAR`（编码 blob） |
+| 构造 | `ST_GeomFromText('POINT (1 2)')` | `VARCHAR`（WKT 文本） | `VARCHAR`（编码 blob） |
+| 关系 | `ST_Contains(region, location)` | `VARCHAR, VARCHAR` | `BOOLEAN` |
+| 度量 | `ST_Distance(a, b)` | `VARCHAR, VARCHAR` | `DOUBLE` |
+| 序列化 | `ST_AsText(location)` | `VARCHAR` | `VARCHAR`（WKT） |
+| 组件 | `ST_Geometries(region)` | `VARCHAR` | `ARRAY<VARCHAR>` |
 
-以 `StContains` 为例：
+对应到代码，例如 `StContains` 的签名就是「两个 VARCHAR → BOOLEAN」：
 
 ```java
-public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
-    FunctionSignature.ret(BooleanType.INSTANCE)
-        .args(VarcharType.SYSTEM_DEFAULT, VarcharType.SYSTEM_DEFAULT)
-);
+FunctionSignature.ret(BooleanType.INSTANCE)
+    .args(VarcharType.SYSTEM_DEFAULT, VarcharType.SYSTEM_DEFAULT)
 ```
 
-几何参数与返回值均为 `VARCHAR`，关系判断函数返回 `BOOLEAN`，度量函数返回 `DOUBLE`，`ST_Geometries` 返回 `ARRAY<VARCHAR>`。
-
-### 2.3 SQL 处理流程
-
-#### 解析（Parsing）
-
-`ST_*` 函数作为普通标量函数调用解析，无专用 grammar 规则。例如：
+因此下面写法在类型上是合法的（列本身是 VARCHAR，函数也吃 VARCHAR）：
 
 ```sql
-SELECT ST_Contains(region, ST_Point(lng, lat)) FROM geo_table;
+-- 关系判断：两个几何参数都是「编码后的 VARCHAR」
+SELECT id
+FROM geo_table
+WHERE ST_Contains(region, location);
+
+-- 也可以临时构造点，不必先落列
+SELECT id
+FROM geo_table
+WHERE ST_Contains(region, ST_Point(lng, lat));
+
+-- 度量：返回 DOUBLE
+SELECT id, ST_Distance(location, ST_Point(116.397, 39.908)) AS dist_m
+FROM geo_table
+ORDER BY dist_m;
+
+-- NULL 传播：AlwaysNullable，任一几何入参为 NULL → 结果为 NULL
+SELECT ST_Contains(NULL, ST_Point(116.4, 39.9));  -- NULL
 ```
 
-#### 绑定与类型检查（Binding）
+### 2.3 SQL 处理流程（结合源码逐步走读）
 
-`BindExpression` 通过 `FunctionRegistry` 查找 `BuiltinScalarFunctions` 中注册的函数，按 `FunctionSignature` 做参数类型推断与隐式转换。Geo 函数无特殊绑定逻辑，走通用标量函数路径。
+用这条查询串起整条 FE 链路。读完应能回答：**`ST_Contains` 在 FE 里到底变成了什么对象、类型怎么定、为什么最终还是普通标量函数下发 BE。**
 
-#### 计划生成（Planning）
+```sql
+SELECT id,
+       ST_Contains(region, ST_Point(lng, lat)) AS inside
+FROM geo_table
+WHERE ST_Distance_Sphere(lng, lat, 116.4, 39.9) < 5000;
+```
 
-Geo 函数翻译为通用 `ScalarFunction` 物理算子，下发至 BE 执行。当前 **没有** Geo 专用的：
+整体流水线：
 
-- Physical Plan 节点
-- Join Rewrite 规则
-- 谓词下推（Predicate Pushdown）规则
-- 空间索引扫描算子
+```text
+SQL 文本
+  │ ① Parser (DorisParser.g4 + LogicalPlanBuilder)
+  ▼
+UnboundFunction("st_contains", [...])   ← 只有名字和参数，还没有类型
+  │ ② Bind (ExpressionAnalyzer / BindExpression)
+  ▼
+StContains( StPoint(lng, lat), ... )    ← Nereids 表达式类，带 FunctionSignature
+  │ ③ Rewrite / Plan（通用规则，无 Geo 专用）
+  ▼
+PhysicalProject / PhysicalFilter 里的 ScalarFunction
+  │ ④ Translate (ExpressionTranslator)
+  ▼
+FunctionCallExpr("st_contains", ...)    ←  thrift 发给 BE
+```
 
-#### 常量折叠（Constant Folding）
+#### ① 解析（Parsing）：当成普通 `foo(...)`，没有 Geo 语法
 
-`FoldConstantRuleOnBE` 对 `st_*` 函数做了显式跳过：
+语法文件里，函数调用是**通配规则**，不区分 `ST_*`：
+
+```antlr
+# DorisParser.g4
+functionCallExpression
+    : functionIdentifier LEFT_PAREN (arguments ...)? RIGHT_PAREN ...
+functionNameIdentifier
+    : identifier   # st_contains / abs / length 都走这里
+```
+
+`LogicalPlanBuilder.visitFunctionCallExpression` 读到函数名和参数后，统一构造 `UnboundFunction`：
 
 ```java
+// LogicalPlanBuilder.java
+String functionName = ctx.functionIdentifier().functionNameIdentifier().getText();
+// → "ST_Contains" / "st_point"（大小写不敏感，后续会规范化）
+List<Expression> params = visit(...);  // 递归解析参数
+return processUnboundFunction(..., functionName, ..., params, ...);
+// 最终：new UnboundFunction(dbName, functionName, isDistinct, params, ...)
+```
+
+因此上面 SQL 在解析后，SELECT 列表里大致是这样一棵**未绑定**树（示意）：
+
+```text
+UnboundFunction("st_contains")
+├── UnboundSlot("region")
+└── UnboundFunction("st_point")
+    ├── UnboundSlot("lng")
+    └── UnboundSlot("lat")
+```
+
+要点：
+
+- Parser **不认识**「几何」；它只认识「名字 + 括号 + 参数列表」。
+- 没有 `CREATE TABLE (... GEOMETRY)`、`CREATE SPATIAL INDEX` 的专用成功路径（后者最多是 MySQL 兼容错误码）。
+- 同理，`ABS(-1)` 解析出来也是 `UnboundFunction("abs", ...)`——**路径完全一样**。
+
+#### ② 绑定（Binding）：按名字查表 → 换成 `St*` 类 → 用签名定类型
+
+绑定发生在 `BindExpression` 分析表达式时；真正绑函数的逻辑在 `ExpressionAnalyzer.visitUnboundFunction`：
+
+```java
+// ExpressionAnalyzer.java
+FunctionRegistry functionRegistry = Env.getCurrentEnv().getFunctionRegistry();
+FunctionBuilder builder = functionRegistry.findFunctionBuilder(dbName, functionName, arguments);
+Pair<Expression, BoundFunction> buildResult = builder.build(functionName, arguments);
+// buildResult.first 就是 StContains / StPoint 等具体类的实例
+```
+
+`FunctionRegistry` 的内容来自启动时注册：
+
+```java
+// BuiltinScalarFunctions.java
+scalar(StContains.class, "st_contains"),
+scalar(StPoint.class, "st_point"),
+scalar(StDistanceSphere.class, "st_distance_sphere"),
+// ... 共 32 个 st_*
+```
+
+查到 `StPoint` / `StContains` 后，用它们类里写死的签名做类型检查与返回类型推断：
+
+```java
+// StPoint.java
+FunctionSignature.ret(VarcharType.SYSTEM_DEFAULT)
+    .args(DoubleType.INSTANCE, DoubleType.INSTANCE);
+// 含义：ST_Point(DOUBLE, DOUBLE) → VARCHAR（几何 blob）
+
+// StContains.java
+FunctionSignature.ret(BooleanType.INSTANCE)
+    .args(VarcharType.SYSTEM_DEFAULT, VarcharType.SYSTEM_DEFAULT);
+// 含义：ST_Contains(VARCHAR, VARCHAR) → BOOLEAN
+```
+
+把这个过程对应回 SQL：
+
+```sql
+ST_Point(lng, lat)
+-- lng/lat 列类型是 DOUBLE
+-- → 匹配 StPoint 签名
+-- → 表达式类型变成 VARCHAR（注意：不是 GEOMETRY）
+
+ST_Contains(region, ST_Point(lng, lat))
+-- region: VARCHAR（存编码 blob）
+-- ST_Point(...): VARCHAR
+-- → 匹配 StContains 签名
+-- → 整个表达式类型变成 BOOLEAN（可作为 SELECT 列 / WHERE 谓词）
+```
+
+绑定后的表达式树示意：
+
+```text
+StContains                         -- BoundFunction / ScalarFunction，类型 BOOLEAN
+├── SlotReference(region)          -- VARCHAR
+└── StPoint                        -- 类型 VARCHAR
+    ├── SlotReference(lng)         -- DOUBLE
+    └── SlotReference(lat)         -- DOUBLE
+```
+
+错误同样走通用路径：参数个数不对、类型对不上签名，就报普通「函数签名不匹配」，**没有**额外的 Geo 专项错误处理。
+
+#### ③ 计划生成（Planning）：还是普通 Project / Filter，没有「空间扫描」
+
+Nereids 把表达式挂在通用算子上，例如：
+
+```text
+Logical/Physical Filter:  ST_Distance_Sphere(lng, lat, 116.4, 39.9) < 5000
+Logical/Physical Project: id, ST_Contains(region, ST_Point(lng, lat)) AS inside
+         │
+         └── OlapScan(geo_table)   ← 普通表扫描，不是 SpatialIndexScan
+```
+
+优化器**当前没有**：
+
+| 能力 | 现状 |
+|------|------|
+| Geo 专用 Physical Plan 节点 | 无 |
+| 空间 Join Rewrite | 无 |
+| `ST_Contains` 谓词下推到存储 | 无 |
+| 空间索引扫描 | 无 |
+
+所以：
+
+```sql
+WHERE ST_Contains(region, ST_Point(116.4, 39.9))
+```
+
+和
+
+```sql
+WHERE id > 10
+```
+
+在优化器眼里都是「Filter 上的标量表达式」。差别只在于前者在 BE 里算得更贵，且无法靠 ZoneMap / 索引裁剪行。
+
+#### ④ 下发 BE（Translate）：`StContains` → `FunctionCallExpr("st_contains")`
+
+物理计划翻译成旧执行树时，所有 Nereids `ScalarFunction`（含 `StContains`）走同一条路径：
+
+```java
+// ExpressionTranslator.visitScalarFunction
+org.apache.doris.catalog.ScalarFunction catalogFunction =
+    new ScalarFunction(new FunctionName(function.getName()), argTypes, returnType, ...);
+return new FunctionCallExpr(catalogFunction, new FunctionParams(false, arguments), ...);
+```
+
+BE 收到的是名字为 `st_contains` 的普通标量调用，再由 `register_function_geo()` 注册的实现逐行执行。FE **从不**打开几何二进制去做空间判断。
+
+#### ⑤ 常量折叠：显式跳过所有 `st_*`
+
+```java
+// FoldConstantRuleOnBE.shouldSkipFold
 // Frontend can not represent geo types
 if (expr instanceof BoundFunction
         && ((BoundFunction) expr).getName().toLowerCase().startsWith("st_")) {
@@ -150,18 +340,41 @@ if (expr instanceof BoundFunction
 }
 ```
 
-原因：FE 无法在编译期表示 Geo 二进制编码结果，因此所有 `st_*` 表达式不参与 BE 常量折叠优化。
+因此：
 
-### 2.4 外部数据源支持
+```sql
+-- 参数全是常量，也不会在 FE 变成 TRUE；整棵 st_* 树下发 BE
+SELECT ST_Contains(
+    ST_GeomFromText('POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))'),
+    ST_Point(1, 1)
+);
 
-| 数据源 | GEOMETRY 类型处理 |
-|--------|-------------------|
-| 原生 Doris 表 | 不支持 GEOMETRY 列，使用 VARCHAR |
-| JDBC（SAP HANA 等） | `ST_GEOMETRY` / `ST_POINT` → `Type.UNSUPPORTED` |
-| Iceberg | Literal 解析有 GEOMETRY/GEOGRAPHY 分支，但 schema 映射未实现 |
-| MySQL 协议 | `MYSQL_TYPE_GEOMETRY` 仅 wire 兼容 |
+SELECT 1 + 1;  -- 普通标量：FE 可直接折叠为 2
+```
 
-SPATIAL INDEX 仅有 MySQL 兼容错误码（如 `ERR_SPATIAL_MUST_HAVE_GEOM_COL`），FE 中无实际实现。
+`anyMatch(shouldSkipFold)` 还会把「外层依赖内层 `st_*`」的整棵常量树一起跳过。实务上：查询里的 `ST_Point(116.4, 39.9)` 每次仍在 BE 构造/编码，不会变成计划里的常量 blob。
+
+#### 小结（一张表记住 FE 角色）
+
+| 阶段 | 关键类/文件 | 对 Geo 做了什么 | 没做什么 |
+|------|-------------|-----------------|----------|
+| 解析 | `DorisParser.g4`、`LogicalPlanBuilder` | 生成 `UnboundFunction("st_*")` | 不识别 GEOMETRY 类型语法 |
+| 注册 | `BuiltinScalarFunctions` | 名字 → `St*` 类 | — |
+| 绑定 | `ExpressionAnalyzer`、`St*.java` 签名 | 定参数/返回类型（几何=VARCHAR） | 无专用 Geo binder |
+| 计划 | Nereids 通用 Project/Filter/Scan | 表达式挂在普通算子上 | 无空间索引、无谓词下推 |
+| 翻译 | `ExpressionTranslator` | → `FunctionCallExpr` | 不在 FE 算几何 |
+| 折叠 | `FoldConstantRuleOnBE` | 跳过所有 `st_*` | 不做编译期求值 |
+
+### 2.4 外部数据源与索引（SQL 视角）
+
+| 场景 | SQL / 行为 | FE 处理 |
+|------|------------|---------|
+| 原生 Doris 表 | `CREATE TABLE t (g VARCHAR(...))` | 唯一推荐路径 |
+| 原生 Doris 表 | `CREATE TABLE t (g GEOMETRY)` | 不支持 |
+| 空间索引 | `CREATE SPATIAL INDEX ...` | 无实现，仅有 MySQL 兼容错误码 |
+| JDBC Catalog（如 SAP HANA） | 远程列类型 `ST_GEOMETRY` | 映射为 `Type.UNSUPPORTED` |
+| Iceberg | schema 中的 GEOMETRY/GEOGRAPHY | Literal 有分支，列类型映射未落地 |
+| MySQL 协议 | 客户端看到 GEOMETRY 类型码 | 仅 wire 兼容，内部仍非 GEOMETRY 列 |
 
 ### 2.5 FE 关键文件
 
