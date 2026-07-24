@@ -107,14 +107,27 @@ A-1 与 A-2 不冲突：Phase A1 先落地拿到单 block 内收益并完成三�
 
 ### 4.3 Phase A2：轻量路径 — `ST_GeometryType`
 
-当前 `ST_GeometryType` 为取类型名而执行完整 decode（大多边形需解整棵 S2 结构）。编码布局的前 2 字节已含类型信息：
+`ST_GeometryType(geom)` 只返回类型名字符串（`"ST_POINT"` / `"ST_POLYGON"` 等），不需要坐标、不做任何空间计算。但现状实现（`functions_geo.cpp` 中 `StGeometryType::execute`）每行都走完整 `GeoShape::from_encoded`：读类型 → 堆上构造对应对象 → **decode 整段 S2 payload**（大多边形代价高），最后仅调用虚函数 `GeometryType()` 返回一个固定字符串，payload 的解码结果被完全丢弃。
+
+类型信息其实就在编码头部。`GeoShape::encode_to`（`geo_types.cpp`）的写入布局为：
 
 ```text
 [0x00][GeoShapeType][S2 payload...]
  保留    类型枚举     坐标等（本函数不需要）
 ```
 
-在 `geo_types` 增加 `GeoShape::type_name_from_encoded` 类 helper，只读头部映射 `"ST_POINT"` / `"ST_POLYGON"` 等；非法头返回 NULL。输出字符串与现版本逐字节一致。
+改造：在 `geo_types` 增加静态 helper（如 `GeoShape::type_name_from_encoded(const void*, size_t)`），只读头部返回类型名，**不构造 `GeoShape`、不解 S2**；`StGeometryType::execute` 改用它。校验规则与 `from_encoded` 的头部检查逐条对齐，保证 NULL 语义不变：
+
+| 输入 | `from_encoded`（现状） | helper（改后） |
+|------|----------------------|---------------|
+| `size < 2` 或首字节非 `0x00` | 返回 nullptr → 该行 NULL | 同样返回失败 → 该行 NULL |
+| 第 2 字节不在已知 `GeoShapeType` 枚举内 | default 分支返回 nullptr → NULL | 同样 NULL |
+| 头部合法但 payload 损坏 | payload decode 失败 → NULL | **返回类型名（唯一行为差异点，见下）** |
+| 合法输入 | 完整 decode 后调 `GeometryType()` | 直接映射同一字符串，逐字节一致 |
+
+唯一的行为差异点：头部合法、payload 损坏的 blob，现状返回 NULL，改后返回类型名。该场景仅在数据损坏时出现（正常链路的 blob 均由 `encode_to` 产出），且「类型名可由头部确定」在语义上合理；是否为此保留完整校验（将牺牲全部优化收益）列入 §10 待评审确认。
+
+类型名映射与各 `GeoShape` 子类 `GeometryType()` 返回值保持单一来源（枚举 → 字符串对照集中在 `geo_types` 内，UT 校验两者一致），避免未来新增类型时漏改。
 
 附带项：复核 `ST_X` / `ST_Y`（现已用栈上 `GeoPoint` + `decode_from`，无需大改）；对外保持约 13 位小数行为，热点待 profiling 证实后另行小改。
 
@@ -333,7 +346,7 @@ for (int row = 0; row < size; ++row) {
 |------|------|------|
 | 存量 SQL（两参写法） | 走原三维球面路径，结果不变 | 兼容 |
 | 存量数据（VARCHAR 编码 blob） | 编码格式不变 | 兼容 |
-| NULL / 非法输入 | WS-A 错误路径对齐 `StDistance`（const 侧非法 → 整列 NULL，与逐行 NULL 语义一致，Phase A1/A5 行为相同）；WS-B 遵循既有 nullable 语义 | 兼容 |
+| NULL / 非法输入 | WS-A 错误路径对齐 `StDistance`（const 侧非法 → 整列 NULL，与逐行 NULL 语义一致，Phase A1/A5 行为相同）；`ST_GeometryType` 轻量路径存在一处仅数据损坏场景的差异（§4.3）；WS-B 遵循既有 nullable 语义 | 兼容（一处待确认项见 §10） |
 | 输出精度 | `ST_AsText` 13 位小数、`contains` 边界容差 `1e-6` 均不变 | 兼容 |
 | 升级/降级 | 纯函数层改动，无持久化格式变化；降级后三参 SQL 报「函数不存在」，属预期 | 可接受 |
 | 生态对比 | 第三参为 Doris 扩展语法；PostGIS 无此参数（其 `geometry`/`geography` 类型天然区分两种模型） | 需在用户文档中说明 |
@@ -344,8 +357,8 @@ for (int row = 0; row < size; ++row) {
 
 | 文件 | 覆盖 |
 |------|------|
-| `be/test/exprs/function/geo/function_geo_test.cpp` | WS-A：const_vector / vector_const / vector_vector 三分支结果一致性；const 侧非法整列 NULL；Phase A5 open/execute/close 生命周期（含 state 命中与未命中路径结果一致）。WS-B：三参执行（含常量列、列值列、NULL） |
-| `be/test/exprs/function/geo/geo_types_test.cpp` | WS-B：同一输入二维/三维路径结果对比；`disjoint == !intersects` 不变式（两种模式） |
+| `be/test/exprs/function/geo/function_geo_test.cpp` | WS-A：const_vector / vector_const / vector_vector 三分支结果一致性；const 侧非法整列 NULL；`ST_GeometryType` 全类型 + 非法头用例；Phase A5 open/execute/close 生命周期（含 state 命中与未命中路径结果一致）。WS-B：三参执行（含常量列、列值列、NULL） |
+| `be/test/exprs/function/geo/geo_types_test.cpp` | WS-A：`type_name_from_encoded` 与各子类 `GeometryType()` 一致性。WS-B：同一输入二维/三维路径结果对比；`disjoint == !intersects` 不变式（两种模式） |
 
 ### 7.2 回归测试
 
@@ -356,6 +369,7 @@ for (int row = 0; row < size; ++row) {
 ### 7.3 性能验证
 
 - 基准：`WHERE ST_Contains(region, ST_Point(...))`（vector_const）与大多边形 const_vector 场景，对比改前后 CPU / 耗时。
+- Phase A2 验证：大多边形列上 `ST_GeometryType` 的 CPU 对比（full decode vs 读头）。
 - Phase A5 增量验证：多 block 大表场景（常量侧 decode 从每 block 一次降为每 fragment 一次），对比 A1 与 A5 的差值。
 - 可选用 `opensky_p2` 真实负载复核。
 
@@ -409,6 +423,7 @@ flowchart LR
 | `SimpleFunctionFactory` 同名多 arity 注册行为与 FE 分发不一致（双注册策略） | 中 | PR-B2 前先做注册链路 spike；不满足则改用 variadic 特化 |
 | WS-A 与 WS-B 同时改 `StRelationFunction` 产生合入冲突 | 中 | §8.1 已约定顺序：A1 先行，B2 基于 A1，A3（prepare 缓存）最后 |
 | `GeoFunction` 为全部 geo 函数共用模板，`open` 逻辑误挂到不需要缓存的函数 | 中 | 按 Impl trait 分流，仅关系函数（及后续构造函数）启用；UT 覆盖无缓存函数的 open 空路径 |
+| `ST_GeometryType` 轻量路径与 `GeometryType()` 字符串映射漂移（新增几何类型时漏改） | 低 | 映射集中单一来源；UT 遍历全部类型校验两路径一致 |
 | const 侧非法 blob 整列 NULL 与逐行语义在极端场景存在感知差异 | 低 | 与 `StDistance` 现行为一致，属既有先例；回归用例固化 |
 | Nereids 存在隐式依赖 `BinaryExpression` 的规则 | 低 | PR-B1 全量排查 `instanceof BinaryExpression` 对四类的引用 |
 
@@ -416,10 +431,11 @@ flowchart LR
 
 1. **BE arity 策略**：双注册 vs variadic 特化（§5.4.1），倾向先 spike 双注册。
 2. **`DEFAULT_USE_SPHERE` 默认值**：本方案定为 `true`（兼容优先）；是否有长期对齐 PostGIS 平面语义的诉求。
-3. **Phase A4（一元函数扫尾）是否随 PR-A2 交付**，或降级为技术债跟踪。
-4. **Phase A5 的 context 传递方式**：统一给 `Impl::execute` 加 `FunctionContext*` 参数，还是仅对关系函数做特化模板（后者改动更小，推荐）。
-5. **Phase A5 构造函数缓存（`StConstructState`）是否随 PR-A3 交付**，或拆为独立 follow-up。
-6. **性能基准口径**：是否要求在 `opensky_p2` 负载上给出量化报告作为 PR-A1 / PR-A3 验收条件。
+3. **`ST_GeometryType` 对「头部合法、payload 损坏」blob 的行为**（§4.3）：建议接受返回类型名（仅数据损坏场景，语义合理）；若评审要求严格 NULL 对齐，则该优化收益归零，Phase A2 缩减为仅 `ST_X`/`ST_Y` 复核。
+4. **Phase A4（一元函数扫尾）是否随 PR-A2 交付**，或降级为技术债跟踪。
+5. **Phase A5 的 context 传递方式**：统一给 `Impl::execute` 加 `FunctionContext*` 参数，还是仅对关系函数做特化模板（后者改动更小，推荐）。
+6. **Phase A5 构造函数缓存（`StConstructState`）是否随 PR-A3 交付**，或拆为独立 follow-up。
+7. **性能基准口径**：是否要求在 `opensky_p2` 负载上给出量化报告作为 PR-A1 / PR-A3 验收条件。
 
 ---
 
