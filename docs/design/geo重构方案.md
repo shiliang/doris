@@ -312,7 +312,60 @@ public:
 | `is_polygon_touches_line_2d` / `is_polygon_touches_polygon_2d` | 边界接触且无内部重叠 |
 | `is_circle_intersects_polygon_2d` / `is_circle_touches_polygon_2d` / `is_circle_contains_point_2d` | 平面距离模型 |
 
-#### 5.4.4 执行体
+#### 5.4.4 三维（球面）计算辅助函数（`geo_types.cpp`）
+
+与二维不同，球面路径的几何运算**主体依赖 S2 库**。但 S2 的部分 API 在边界场景（线段与多边形环共线、纯边界接触等）存在数值精度或方向性 bug，因此同样需要若干手工补丁函数。这些函数**不是纯 S2 wrapper**——它们修正了 S2 无法正确处理的边缘情况。
+
+##### 5.4.4.1 多边形与线段的球面交互
+
+| 函数 | 调用方 | S2 依赖 | 为什么需要手工补丁 |
+|------|--------|---------|-------------------|
+| `is_polygon_intersects_line_sphere` | `GeoPolygon::intersects`、`GeoLine::intersects` | `S2Polygon::IntersectWithPolyline()` | S2 可能在数值精度问题下漏报仅边界相交的情况；补丁对每条多边形边与每条线段用 `is_segments_intersect` 做二次兜底 |
+| `is_polygon_touches_line_sphere` | `GeoPolygon::touches` | `S2Polygon::IntersectWithPolyline()` | 需区分"内部重叠"与"纯边界接触"——收集交点线的所有顶点，逐一确认是否都在多边形顶点集合中（即交点完全落在边界上） |
+| `is_polygon_contains_line_sphere` | `GeoPolygon::contains` | `S2Polygon::Contains(S2Polyline)` | S2 的 `Contains` 在 collinear 线段方向判定上有已知缺陷；补丁检查线段顶点是否落在多边形边上但不形成线-线接触（`is_line_touches_line`），以此区分"内部"和"穿越边界" |
+
+##### 5.4.4.2 多边形 vs 多边形的边界接触判定
+
+| 函数 | 调用方 | S2 依赖 | 为什么需要手工补丁 |
+|------|--------|---------|-------------------|
+| `is_polygon_intersection_empty_sphere` | `GeoPolygon::touches` | `S2Polygon::InitToIntersection()` | 两个多边形 `touches` = 相交但无内部重叠；直接构造 S2 交集多边形并检查其面积是否 < `TOLERANCE`，面积接近零即仅有边界接触 |
+
+注意：`GeoPolygon::intersects` 在处理 POLYGON × POLYGON 且 `use_sphere=true` 时，直接用 `S2Polygon::Intersects()` 加 `polygon_touch_polygon` 兜底（同上边界漏报问题），没有对应的独立静态辅助函数——该逻辑内联在 `intersects` 方法体中。
+
+##### 5.4.4.3 GeoCircle 的球面方法
+
+Circle 在 `use_sphere=true` 时通过成员方法 `intersects_sphere` / `touches_sphere` 分发，而非 `_2d` 版的 plane 静态函数。这两个方法虽然是成员函数，但其算法同样值得说明：
+
+| 方法 | 算法要点 |
+|------|----------|
+| `GeoCircle::intersects_sphere` | Point: 大圆距离 ≤ radius + TOLERANCE；Line: `compute_distance_to_line` ≤ radius；Polygon: 圆心在内部或任一边的大圆距离 ≤ radius；Circle×Circle: 中心大圆距离 ≤ r1+r2+TOLERANCE |
+| `GeoCircle::touches_sphere` | Point: `|radius - distance| < TOLERANCE`；Line: `|radius - distance_to_line| < TOLERANCE`；Polygon: 排除圆心在内部/在边界上的情况后，检查任一边到圆心距离 ≈ radius；MultiPolygon: 任一子 polygon 有 intersects 且所有相交者均为 pure touch |
+
+##### 5.4.4.4 三维路径的几何基元
+
+以下函数**不区分 2D/3D**，两种模式共用：
+
+| 函数 | 用途 | 说明 |
+|------|------|------|
+| `is_segments_intersect` | 线段相交判断 | 提取 lat/lng 度数后在平面做欧几里得相交测试；球面路径用它做边界补丁（因为大圆与多边形边的相交退化到点级后 lat/lng 小范围内的欧几里得近似足够） |
+| `is_point_in_polygon` | ray casting | 经典光线投射法判断点是否在多边形内；lat/lng 度数平面上的算法，两种模式共用 |
+| `compute_distance_to_point` | 大圆距离（米） | 球面 Haversine 距离，Circle 球面模式和 ST_Distance 的基础 |
+| `compute_distance_to_line` | 点到线段最短距离（米） | 球面大圆距离，用于 touches/intersects 阈值判定 |
+
+##### 5.4.4.5 与二维函数的映射关系
+
+| 关系操作 | 二维辅助函数 | 三维辅助函数 | 备注 |
+|----------|-------------|-------------|------|
+| Polygon × Line intersects | `is_polygon_intersects_line_2d` | `is_polygon_intersects_line_sphere` | 2D 用平面线段穿过判断；3D 用 S2 `IntersectWithPolyline` + 补丁 |
+| Polygon × Line touches | `is_polygon_touches_line_2d` | `is_polygon_touches_line_sphere` | |
+| Polygon × Line contains | `is_polygon_contains_line_2d` | `is_polygon_contains_line_sphere` | |
+| Polygon × Polygon intersects | `is_polygon_intersects_polygon_2d` | `S2Polygon::Intersects()` + `polygon_touch_polygon`（内联） | 3D 侧无独立静态函数 |
+| Polygon × Polygon touches | `is_polygon_touches_polygon_2d` | `is_polygon_intersection_empty_sphere` + `polygon_touch_polygon` | 3D 需要面积检查 |
+| Polygon × Point contains | `is_point_in_or_on_polygon_2d` etc. | `S2Polygon::Contains(S2Point)` | S2 原生 API 足够，无独立函数 |
+| Circle × Polygon intersects | `is_circle_intersects_polygon_2d` | `GeoCircle::intersects_sphere` | 成员方法 vs 静态函数的差异 |
+| Circle × Point contains | `is_circle_contains_point_2d` | `S2Cap::Contains()` | S2 原生 API 足够 |
+
+#### 5.4.5 执行体
 
 第三参逐行读取（列值场景），`ColumnConst` 时提为循环外常量；**禁止用 `get_bool(0)` 代表整列**：
 
@@ -330,12 +383,12 @@ for (int row = 0; row < size; ++row) {
 
 与 WS-A 的组合：`use_sphere` 为常量列时同样纳入 const 分支优化，几何常量侧的一次性 decode 与计算模型选择正交。
 
-#### 5.4.5 BE 改动清单
+#### 5.4.6 BE 改动清单
 
 | 文件 | 改动 | 备注 |
 |------|------|------|
 | `geo_types.h` | `use_sphere` 重载与内部分发声明 | |
-| `geo_types.cpp` | 二维辅助函数 + 各类型实现 | 体量最大 |
+| `geo_types.cpp` | 二维辅助函数 + 三维辅助函数 + 各类型实现 | 体量最大 |
 | `functions_geo.h` | arity 策略（双注册或 variadic） | 评审确定后实施；易遗漏 |
 | `functions_geo.cpp` | 执行体、按行读第三参 | 与 WS-A 改动同文件，注意合入顺序 |
 | `PaloInternalService.thrift` | 本期**不改**；仅未来实施 B-2 时新增 `TQueryOptions` 字段 | |
