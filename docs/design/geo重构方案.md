@@ -6,7 +6,6 @@
 | 文档状态 | 待评审                                                                                                                                                                                                                                                                                      |
 | 涉及模块 | BE `exprs/function/geo`、FE Nereids 函数签名                                                                                                                                                                                                                                                  |
 | 方案范围 | ① 执行层性能优化（Batch / 对象复用 / prepare 缓存）；② 空间关系函数二维/三维计算一致性                                                                                                                                                                                                                                  |
-| 相关文档 | `[geo-spatial-design.md](./geo-spatial-design.md)`、`[geo-batch-reuse-plan.md](./geo-batch-reuse-plan.md)`、`[constant-fold-geo-analysis.md](./constant-fold-geo-analysis.md)`、`[架构建议.md](./架构建议.md)`、飞书 [GEO二维/三维计算一致性分析](https://pansw43kpjc.feishu.cn/wiki/O4sKw6Z5BiKddRkb1nDcGEc4n0d) |
 
 
 ---
@@ -15,7 +14,7 @@
 
 Doris 当前的 Geo 能力采用「函数层 GIS + VARCHAR 载体」模型：几何对象在 SQL 类型系统中以 `VARCHAR`/`STRING` 表示，内部承载自定义二进制编码；所有几何解析与空间计算在 BE 基于 Google S2 执行；FE 不做几何计算，`st_*` 函数被常量折叠显式跳过（`FoldConstantRuleOnBE.shouldSkipFold`）。
 
-在该架构下，本方案要解决两个相互独立的问题。
+在这个架构下，有两个独立的问题要解决。
 
 ### 1.1 问题一：执行层性能——批量执行中重复 decode
 
@@ -32,49 +31,42 @@ for (int row = 0; row < size; ++row) {
 }
 ```
 
-典型查询 `WHERE ST_Contains(region, ST_Point(116.4, 39.9))` 中，右侧点在整个查询内不变，但每行都会完整执行一次 `from_encoded`（解码 + 堆分配 + S2 对象构造）。百万行即百万次无效解码；左侧为常量大多边形时（如省级边界），浪费更为显著。由于 FE 对 `st_*` 不做常量折叠（FE 无法表示 Geo 二进制值，详见 `constant-fold-geo-analysis.md`），该开销无法在计划期消除，只能在执行层解决。
+典型查询 `WHERE ST_Contains(region, ST_Point(116.4, 39.9))` 中，右侧点在整个查询内不变，但每行都会完整执行一次 `from_encoded`（解码 + 堆分配 + S2 对象构造）。百万行即百万次无效解码；左侧为常量大多边形时（如省级边界），浪费更为显著。由于 FE 对 `st_*` 不做常量折叠（FE 无法表示 Geo 二进制值，见 `constant-fold-geo-analysis.md`），这个开销没法在计划期消掉，只能靠执行层解决。
 
-同文件中 `StDistance` 已实现 `unpack_if_const` + `const_vector` / `vector_const` / `vector_vector` 三分支，证明该优化模式在当前代码框架内可行且有先例。
+同文件的 `StDistance` 已经用了 `unpack_if_const` + `const_vector` / `vector_const` / `vector_vector` 三分支，说明这套优化在当前框架里完全可行。
 
 ### 1.2 问题二：语义一致性——二维/三维计算路径结果不一致
 
-空间关系函数基于 S2 的三维球面模型计算，而用户（尤其从 PostGIS / MySQL 迁移的用户）通常预期平面二维语义。两种模型对同一输入可能给出不同结果——例如长线段与多边形的相交判断，球面大圆路径与平面直线路径可能穿过不同区域。当前引擎无法让用户选择计算模型，也无法在一条 SQL 中表达「按平面语义判断」。
+空间关系函数基于 S2 的三维球面模型计算，但从 PostGIS / MySQL 迁过来的用户通常预期的是平面二维语义。两种模型对同一输入可能给出不同结果——比如一条长线段和多边形的相交判断，球面大圆路径和平面直线路径可能穿过不同的区域。当前引擎既不能选计算模型，也没法在一条 SQL 里表达"按平面语义判断"。
 
-经前期分析（见飞书文档），候选方案已完成对比，**结论为采用方案一：为四个空间关系函数增加可选第三参数** `use_sphere BOOLEAN`。本文档给出该决策的落地设计。
+前期分析（见飞书文档）对比过几种候选方案，决定给四个空间关系函数加一个可选第三参数 `use_sphere BOOLEAN`。本文档给出具体落地方式。
 
 ## 2. 目标
 
-
-
-### 2.1 目标
-
-
-| 编号  | 目标                     | 度量                                                                                             |
-| --- | ---------------------- | ---------------------------------------------------------------------------------------------- |
-| G1  | 消除常量侧几何对象的重复 decode    | 常量侧 decode 次数从 O(N) 降至 O(1)（Phase A5 后进一步降至每 fragment 1 次）；`ST_Contains(col, 常量)` 类查询 CPU 显著下降 |
-| G2  | 降低轻量函数的无效开销            | `ST_GeometryType` 不再做完整 S2 decode                                                              |
-| G3  | 提供二维/三维计算模型的 SQL 级选择能力 | 四个关系函数支持 `use_sphere` 第三参，同一 SQL 内可混用两种模式                                                      |
-| G4  | 全程语义兼容                 | 存量两参写法的结果与现版本完全一致（含 NULL / 非法输入路径）                                                             |
+| 编号  | 目标                        | 怎么验证                                                                                             |
+| --- | ------------------------- | ------------------------------------------------------------------------------------------------ |
+| G1  | 消除常量侧几何对象的重复 decode       | 常量侧 decode 次数从 O(N) 降到 O(1)（Phase A5 后进一步降到每 fragment 1 次）；`ST_Contains(col, 常量)` 类查询 CPU 显著下降 |
+| G2  | 去掉轻量函数中的无效开销              | `ST_GeometryType` 不再做完整 S2 decode                                                              |
+| G3  | 提供二维/三维计算模型的 SQL 级选择能力    | 四个关系函数支持 `use_sphere` 第三参，同一 SQL 内可以混用两种模式                                                      |
+| G4  | 兼容存量行为                    | 存量两参写法的结果与现版本完全一致（包括 NULL / 非法输入路径）                                                             |
 
 
 
 
 ## 3. 方案总览
 
-方案包含两条独立工作流（Workstream），改动均收敛于 `be/src/exprs/function/geo/` 与 FE 四个函数签名类，可并行推进、独立交付、独立回滚：
+分两条独立工作流，改动都在 `be/src/exprs/function/geo/` 和 FE 四个函数签名类里，可以并行推进、独立交付、独立回滚：
 
 
-| 工作流             | 解决的问题          | 核心手段                                                     | 是否改变对外行为      |
-| --------------- | -------------- | -------------------------------------------------------- | ------------- |
-| **WS-A 执行层性能**  | §1.1 重复 decode | const/vector 三分支、编码头轻量读取、循环外槽位复用、`open/close` prepare 缓存 | 否（纯性能优化，结果不变） |
-| **WS-B 计算模型选择** | §1.2 二维/三维不一致  | 四函数新增可选 `use_sphere` 参数，BE 增加二维计算路径                      | 新增能力；存量写法行为不变 |
+| 工作流              | 解决的问题          | 核心手段                                                     | 是否改变对外行为      |
+| ---------------- | -------------- | -------------------------------------------------------- | ------------- |
+| **WS-A 执行层性能**   | §1.1 重复 decode | const/vector 三分支、编码头轻量读取、循环外槽位复用、`open/close` prepare 缓存 | 否（纯性能优化，结果不变） |
+| **WS-B 计算模型选择**  | §1.2 二维/三维不一致  | 四函数新增可选 `use_sphere` 参数，BE 增加二维计算路径                      | 新增能力；存量写法行为不变 |
 
 
-两条工作流在 `StRelationFunction` 上存在改动交集，合入顺序在 §8 中约定。
+两条工作流在 `StRelationFunction` 上有交集，合入顺序在 §8 说明。
 
 ## 4. 详细设计：WS-A 执行层性能
-
-A1 与 A5 互补：A1 先落地拿到单 block 内收益并完成三分支代码结构，A5 在其上升级为跨 block 复用（机制对比详见附录 A）。
 
 ### 4.1 Phase A1：关系函数 const 三分支（最高 ROI）
 
@@ -94,9 +86,9 @@ A1 与 A5 互补：A1 先落地拿到单 block 内收益并完成三分支代码
 
 1. 错误路径对齐 `StDistance`：const 侧 decode 失败时**整列置 NULL**，不逐行重试。
 
-收益量化（以右侧常量、N 行为例）：decode 次数从 `2N` 降至 `N + 1`；右侧从 N 次降为 1 次。
+收益（右侧常量、N 行为例）：decode 次数从 `2N` 降到 `N + 1`；右侧从 N 次降到 1 次。
 
-本 Phase 不启用 `StContainsState`（留待 Phase A5），不改变任何结果语义。
+本 Phase 不动 `StContainsState`（留到 Phase A5），结果语义不变。
 
 ### 4.2 Phase A2：轻量路径 — `ST_GeometryType`
 
@@ -109,32 +101,51 @@ A1 与 A5 互补：A1 先落地拿到单 block 内收益并完成三分支代码
  保留    类型枚举     坐标等（本函数不需要）
 ```
 
-改造：在 `geo_types` 增加静态 helper（如 `GeoShape::type_name_from_encoded(const void*, size_t)`），只读头部返回类型名，**不构造** `GeoShape`**、不解 S2**；`StGeometryType::execute` 改用它。校验规则与 `from_encoded` 的头部检查逐条对齐，保证 NULL 语义不变：
+改造方式：在 `geo_types` 加一个静态 helper（例如 `GeoShape::type_name_from_encoded(const void*, size_t)`），只读头部返回类型名，不构造 `GeoShape`、不解 S2；`StGeometryType::execute` 改用这个 helper。校验规则与 `from_encoded` 的头部检查逐条对齐，保证 NULL 语义不变：
 
 
 | 输入                            | `from_encoded`（现状）            | helper（改后）            |
 | ----------------------------- | ----------------------------- | --------------------- |
 | `size < 2` 或首字节非 `0x00`       | 返回 nullptr → 该行 NULL          | 同样返回失败 → 该行 NULL      |
 | 第 2 字节不在已知 `GeoShapeType` 枚举内 | default 分支返回 nullptr → NULL   | 同样 NULL               |
-| 头部合法但 payload 损坏              | payload decode 失败 → NULL      | **返回类型名（唯一行为差异点，见下）** |
+| 头部合法但 payload 损坏              | payload decode 失败 → NULL      | **返回类型名（唯一行为差异，见下）** |
 | 合法输入                          | 完整 decode 后调 `GeometryType()` | 直接映射同一字符串，逐字节一致       |
 
 
-唯一的行为差异点：头部合法、payload 损坏的 blob，现状返回 NULL，改后返回类型名。该场景仅在数据损坏时出现（正常链路的 blob 均由 `encode_to` 产出），且「类型名可由头部确定」在语义上合理；是否为此保留完整校验（将牺牲全部优化收益）列入 §10 待评审确认。
-
-类型名映射与各 `GeoShape` 子类 `GeometryType()` 返回值保持单一来源（枚举 → 字符串对照集中在 `geo_types` 内，UT 校验两者一致），避免未来新增类型时漏改。
-
-附带项：复核 `ST_X` / `ST_Y`（现已用栈上 `GeoPoint` + `decode_from`，无需大改）；对外保持约 13 位小数行为，热点待 profiling 证实后另行小改。
 
 ### 4.3 Phase A3：分配减负
 
-在 `vector_vector` 分支上，循环外预置左右 `unique_ptr<GeoShape>` 槽位，每行仅替换所指对象；不引入对象池与通用 blob cache。
+现状在每个 `vector_vector` 迭代内都会构造两个局部 `unique_ptr`，循环结束析构：
+
+```cpp
+// 现状
+for (int row = 0; row < size; ++row) {
+    std::unique_ptr<GeoShape> shape1(GeoShape::from_encoded(lhs));
+    std::unique_ptr<GeoShape> shape2(GeoShape::from_encoded(rhs));
+    auto relation_value = Func::evaluate(shape1.get(), shape2.get());
+}   // shape1、shape2 出作用域 → 析构 → delete 堆对象
+```
+
+改为循环外预置左右 `unique_ptr<GeoShape>` 槽位，每次只 `reset` 替换所指对象：
+
+```cpp
+// 改后：槽位提到循环外
+std::unique_ptr<GeoShape> shape1;
+std::unique_ptr<GeoShape> shape2;
+for (int row = 0; row < size; ++row) {
+    shape1.reset(GeoShape::from_encoded(lhs));  // 旧对象自动 delete
+    shape2.reset(GeoShape::from_encoded(rhs));
+    auto relation_value = Func::evaluate(shape1.get(), shape2.get());
+}
+```
+
+不引入对象池与通用 blob cache，没有必要。
 
 ### 4.4 Phase A5：升级为 open/close prepare 缓存（跨 block 复用）
 
 Phase A1 的 const 分支只在单次 `execute` 内生效：同一常量在每个 block 到来时仍要重新 decode 一次。Phase A5 把常量侧 decode 提前到函数 `open` 阶段、缓存进 `FunctionContext`，整个 fragment 生命周期只 decode 一次（与 StarRocks `st_contains_prepare` 同构）。
 
-#### 4.4.1 框架就绪性（已核实源码，非假设）
+#### 4.4.1 框架就绪性（已确认）
 
 
 | 所需能力                | Doris 现状                                                                                                                | 位置                                            |
@@ -146,11 +157,11 @@ Phase A1 的 const 分支只在单次 `execute` 内生效：同一常量在每�
 | 状态结构体               | `StContainsState` / `StConstructState` 已在头文件定义（当前零引用的空壳）                                                                | `functions_geo.h`                             |
 
 
-结论：**无框架级缺口，不需要动 FE / thrift / 函数注册工厂**。此前评估中「需先确认 Doris `IFunction` 等价 API」的疑问已消除。
+结论：框架没有缺口，不需要动 FE / thrift / 函数注册工厂。之前担心的"Doris 有没有等价 IFunction API"已经确认没问题。
 
 #### 4.4.2 现状缺口与改动点
 
-唯一的真实缺口在 Geo 自身：`GeoFunction::execute_impl` 拿到 `FunctionContext*` 后直接丢弃，`Impl::execute` 签名里没有 context：
+真正的缺口只在 Geo 模块自己：`GeoFunction::execute_impl` 拿到 `FunctionContext*` 就扔了，`Impl::execute` 签名里没有 context：
 
 ```cpp
 // functions_geo.h — 现状：context 被丢弃
@@ -160,11 +171,11 @@ Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers&
 }
 ```
 
-改动分三步（对齐 `convert_tz` 先例）：
+改动分三步，对齐 `convert_tz` 的做法：
 
-1. `GeoFunction` **实现** `open/close`：`FRAGMENT_LOCAL` scope 下，对关系函数检查 `is_col_constant(0/1)`；有常量侧则 `get_constant_col` → `GeoShape::from_encoded` → 存入 `StContainsState`（`shared_ptr` 交给 `set_function_state`，无需手工 delete）。常量侧 decode 失败置 `state->is_null`，execute 直接整列 NULL（与 Phase A1 语义一致）。
-2. **打通 context 传递**：`Impl::execute` 增加 `FunctionContext`* 参数（或仅对关系函数做特化模板，其余 Impl 不动，改动更小）。
-3. `StRelationFunction::execute` **读 state**：有缓存侧直接用 `state->shapes[i]`，变侧沿用 Phase A1 的逐行 decode / 槽位复用；state 为空时退回 Phase A1 路径（两模式共存，保证渐进可回滚）。
+1. `GeoFunction` 实现 `open/close`：`FRAGMENT_LOCAL` scope 下，对关系函数检查 `is_col_constant(0/1)`；有常量侧则 `get_constant_col` → `GeoShape::from_encoded` → 存入 `StContainsState`（`shared_ptr` 交给 `set_function_state`，不用手动 delete）。常量侧 decode 失败则置 `state->is_null`，execute 直接整列 NULL（和 Phase A1 语义一致）。
+2. 打通 context 传递：`Impl::execute` 增加 `FunctionContext*` 参数。也可以只给关系函数做特化模板，其他 Impl 不动，这样改动更小。
+3. `StRelationFunction::execute` 读 state：有缓存侧直接用 `state->shapes[i]`，变侧沿用 Phase A1 的逐行 decode / 槽位复用；state 为空时退回 Phase A1 路径（两个模式共存，方便渐进回滚）。
 
 
 
@@ -178,13 +189,13 @@ Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers&
 | 回滚            | —                                   | state 为空自动退回 A1 路径   |
 
 
-Phase A1 完成后，A5 的增量改动主要是 `open/close` 与 state 读写，预计为中小规模单 BE PR（`functions_geo.h/.cpp` + UT）。
+Phase A1 做完后，A5 的增量改动主要是 `open/close` 和 state 读写，预计一个小型 BE PR（`functions_geo.h/.cpp` + UT）。
 
-注意事项：
+注意几点：
 
-- **scope 选择**：跟 `convert_tz` 用 `FRAGMENT_LOCAL`（常量列在 fragment open 时已就绪）；不用 `THREAD_LOCAL`。
-- **模板影响面**：`GeoFunction` 是全部 geo 函数共用模板，`open` 内必须按 Impl 类型分流（如通过 trait 判定是否启用缓存），避免给不需要缓存的函数挂无用 state。
-- **与 WS-B 组合**：第三参 `use_sphere` 为常量时不影响本缓存（缓存的是几何对象，与计算模型正交）。
+- **scope**：跟 `convert_tz` 一样用 `FRAGMENT_LOCAL`（常量列在 fragment open 时就已就绪），不折腾 `THREAD_LOCAL`。
+- **模板影响面**：`GeoFunction` 是所有 geo 函数共用的模板，`open` 里必须按 Impl 类型分流（比如通过 trait 判断要不要开缓存），别给不需要缓存的函数挂无用 state。
+- **和 WS-B 的关系**：第三参 `use_sphere` 是常量时不影响缓存（缓存的是几何对象，和计算模型互不干扰）。
 
 
 
@@ -192,7 +203,7 @@ Phase A1 完成后，A5 的增量改动主要是 `open/close` 与 state 读写�
 
 
 
-### 5.1 备选方案对比与决策
+### 5.1 为什么不选其他方案
 
 
 | 方案                             | 说明                                          | 优点                                     | 缺点                                             | 结论                      |
@@ -202,9 +213,9 @@ Phase A1 完成后，A5 的增量改动主要是 `open/close` 与 state 读写�
 | B-3 新函数名（如 `st_intersects_2d`） | 语义并行的函数族                                    | 实现最简单                                  | 函数数量翻倍，签名爆炸；与 OGC 命名习惯不符                       | 否决                      |
 
 
-默认值决策：两参写法默认 `use_sphere = true`（沿用现有 S2 球面行为），保证存量查询结果不变。`DEFAULT_USE_SPHERE` 在 BE 以常量集中定义。
+默认值：两参写法默认 `use_sphere = true`（沿用现有 S2 球面行为），存量查询结果不变。`DEFAULT_USE_SPHERE` 在 BE 用常量集中定义。
 
-> 待评审确认：默认值是否长期锚定 `true`。若未来希望对齐 PostGIS 平面语义（默认 `false`），需走行为变更流程，本方案不涉及。
+> 待评审：默认值是不是长期锚定 `true`。如果以后想对齐 PostGIS 的平面语义（默认 `false`），要走行为变更流程，不在这次方案里。
 
 
 
@@ -223,13 +234,13 @@ SELECT ST_Intersects(g1, g2);
 
 - 适用函数：`st_intersects` / `st_disjoint` / `st_contains` / `st_touches`（当前 Nereids 已注册的全部空间关系函数）。
 - 第三参为普通布尔表达式，允许列值（逐行生效）、常量与 NULL；NULL 遵循函数整体的 `AlwaysNullable` / `PropagateNullLiteral` 语义。
-- 语义约束：任意 `use_sphere` 取值下，`st_disjoint(g1, g2, s) == NOT st_intersects(g1, g2, s)` 必须成立（允许数值误差内）。
+- 语义约束：不管 `use_sphere` 取什么值，`st_disjoint(g1, g2, s) == NOT st_intersects(g1, g2, s)` 必须成立（允许数值误差）。
 
 
 
 ### 5.3 FE 设计
 
-**关键约束：与** `BinaryExpression` **解绑。** 现四个 `St`* 类实现 `BinaryExpression`（固定两子节点），与 2/3 参并存冲突。改为仅继承 `ScalarFunction` + `ExplicitlyCastableSignature` + `AlwaysNullable` + `PropagateNullLiteral`，`withChildren` 允许 2 或 3 个子节点：
+关键点：必须和 `BinaryExpression` 解绑。现在四个 `St`* 类实现的是 `BinaryExpression`（固定两个子节点），和 2/3 参并存是冲突的。改成只继承 `ScalarFunction` + `ExplicitlyCastableSignature` + `AlwaysNullable` + `PropagateNullLiteral`，`withChildren` 允许 2 或 3 个子节点：
 
 ```java
 // StIntersects.java — 结构示意
@@ -281,7 +292,7 @@ FE 改动清单：
 
 #### 5.4.1 函数注册 arity（固定三参，FE 补默认值）
 
-FE 在表达式构建阶段将两参写法统一补全为三参：`ST_Contains(g1, g2)` → `ST_Contains(g1, g2, true)`，第三参为常量 `DEFAULT_USE_SPHERE`。BE 侧 `NUM_ARGS = 3` 固定，`is_variadic() = false` 不变，无需双注册或 variadic 特化：
+FE 在表达式构建阶段把两参写法统一补成三参：`ST_Contains(g1, g2)` → `ST_Contains(g1, g2, true)`，第三参填常量 `DEFAULT_USE_SPHERE`。BE 侧 `NUM_ARGS = 3` 固定，`is_variadic() = false` 不变，不需要双注册或者 variadic 特化：
 
 ```cpp
 template <typename Func>
@@ -293,7 +304,7 @@ struct StRelationFunction {
 };
 ```
 
-这样 BE 改动最小——无需改 `GeoFunction` 模板，无需动 `SimpleFunctionFactory` 注册，只需在 `execute` 中按正常 3 参读取第三列即可。
+这样 BE 改动最小——不用改 `GeoFunction` 模板，不用动 `SimpleFunctionFactory` 注册，`execute` 里按正常 3 参读第三列就行。
 
 #### 5.4.2 `GeoShape` API
 
@@ -314,9 +325,9 @@ public:
 };
 ```
 
-- `GeoPoint` / `GeoLine` / `GeoPolygon` / `GeoCircle` / `GeoMultiPolygon` 按需 override，内部以 `_2d` / `_3d` 私有方法分发。
-- `GeoMultiPolygon` 必须把 `use_sphere` 透传至内部 polygon 逻辑。
-- 不变式：`disjoint(rhs, s) == !intersects(rhs, s)` 对两种模式均成立。
+- `GeoPoint` / `GeoLine` / `GeoPolygon` / `GeoCircle` / `GeoMultiPolygon` 按需 override，内部用 `_2d` / `_3d` 私有方法分发。
+- `GeoMultiPolygon` 必须把 `use_sphere` 透传到内部 polygon 逻辑。
+- 始终成立：`disjoint(rhs, s) == !intersects(rhs, s)`，两种模式都一样。
 
 
 
@@ -338,7 +349,7 @@ public:
 
 #### 5.4.4 三维（球面）计算辅助函数（`geo_types.cpp`）
 
-与二维不同，球面路径的几何运算**主体依赖 S2 库**。但 S2 的部分 API 在边界场景（线段与多边形环共线、纯边界接触等）存在数值精度或方向性 bug，因此同样需要若干手工补丁函数。这些函数**不是纯 S2 wrapper**——它们修正了 S2 无法正确处理的边缘情况。
+和二维路径不同，球面几何运算主要靠 S2 库。但 S2 的部分 API 在边界场景（线段与多边形环共线、纯边界接触等）有数值精度或方向性 bug，所以也需要几个补充函数来修。这些函数不是简单的 S2 wrapper——它们修的是 S2 处理不了的 edge case。
 
 ##### 5.4.4.1 多边形与线段的球面交互
 
@@ -409,7 +420,7 @@ Circle 在 `use_sphere=true` 时通过成员方法 `intersects_sphere` / `touche
 
 #### 5.4.5 执行体
 
-第三参逐行读取（列值场景），`ColumnConst` 时提为循环外常量；**禁止用** `get_bool(0)` **代表整列**：
+第三参逐行读取（列值场景），`ColumnConst` 时提到循环外；不能用 `get_bool(0)` 代表整列：
 
 ```cpp
 // 伪代码
@@ -423,7 +434,7 @@ for (int row = 0; row < size; ++row) {
 }
 ```
 
-与 WS-A 的组合：`use_sphere` 为常量列时同样纳入 const 分支优化，几何常量侧的一次性 decode 与计算模型选择正交。
+和 WS-A 的关系：`use_sphere` 是常量列时同样走 const 分支优化，几何常量侧的一次性 decode 和计算模型选择互不影响。
 
 #### 5.4.6 BE 改动清单
 
@@ -446,144 +457,10 @@ for (int row = 0; row < size; ++row) {
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------- |
 | 存量 SQL（两参写法）          | 走原三维球面路径，结果不变                                                                                                                                 | 兼容              |
 | 存量数据（VARCHAR 编码 blob） | 编码格式不变                                                                                                                                        | 兼容              |
-| NULL / 非法输入           | WS-A 错误路径对齐 `StDistance`（const 侧非法 → 整列 NULL，与逐行 NULL 语义一致，Phase A1/A5 行为相同）；`ST_GeometryType` 轻量路径存在一处仅数据损坏场景的差异（§4.2）；WS-B 遵循既有 nullable 语义 | 兼容（一处待确认项见 §10） |
+| NULL / 非法输入           | WS-A 错误路径对齐 `StDistance`（const 侧非法 → 整列 NULL，和逐行 NULL 语义一致，Phase A1/A5 行为相同）；`ST_GeometryType` 轻量路径有一处只在数据损坏场景出现的差异（§4.2）；WS-B 遵循既有 nullable 语义 | 兼容（一处待确认项见 §10） |
 | 输出精度                  | `ST_AsText` 13 位小数、`contains` 边界容差 `1e-6` 均不变                                                                                                 | 兼容              |
 | 升级/降级                 | 纯函数层改动，无持久化格式变化；降级后三参 SQL 报「函数不存在」，属预期                                                                                                        | 可接受             |
-| 生态对比                  | 第三参为 Doris 扩展语法；PostGIS 无此参数（其 `geometry`/`geography` 类型天然区分两种模型）                                                                             | 需在用户文档中说明       |
+| 生态对比                  | 第三参为 Doris 扩展语法；PostGIS 无此参数（它的 `geometry`/`geography` 类型天然区分两种模型）                                                                             | 需在用户文档中说明       |
 
 
-
-
-## 7. 测试方案
-
-
-
-### 7.1 单元测试（BE）
-
-
-| 文件                                                 | 覆盖                                                                                                                                                                                       |
-| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `be/test/exprs/function/geo/function_geo_test.cpp` | WS-A：const_vector / vector_const / vector_vector 三分支结果一致性；const 侧非法整列 NULL；`ST_GeometryType` 全类型 + 非法头用例；Phase A5 open/execute/close 生命周期（含 state 命中与未命中路径结果一致）。WS-B：三参执行（含常量列、列值列、NULL） |
-| `be/test/exprs/function/geo/geo_types_test.cpp`    | WS-A：`type_name_from_encoded` 与各子类 `GeometryType()` 一致性。WS-B：同一输入二维/三维路径结果对比；`disjoint == !intersects` 不变式（两种模式）                                                                         |
-
-
-
-
-### 7.2 回归测试
-
-- 目录：`regression-test/suites/query_p0/sql_functions/spatial_functions/`。
-- 存量 `test_gis_function.groovy` 必须零 diff 通过（G4 的直接验证）。
-- 新增用例：四函数三参（true/false/缺省/NULL/列值）端到端行为，遵循仓库规范（`order_qt`、错误用 `test-exception`、结果由脚本生成 `.out`）。
-
-
-
-### 7.3 性能验证
-
-- 基准：`WHERE ST_Contains(region, ST_Point(...))`（vector_const）与大多边形 const_vector 场景，对比改前后 CPU / 耗时。
-- Phase A2 验证：大多边形列上 `ST_GeometryType` 的 CPU 对比（full decode vs 读头）。
-- Phase A5 增量验证：多 block 大表场景（常量侧 decode 从每 block 一次降为每 fragment 一次），对比 A1 与 A5 的差值。
-- 可选用 `opensky_p2` 真实负载复核。
-
-
-
-### 7.4 质量门禁
-
-`./run-be-ut.sh` 通过；`./run-regression-test.sh -d query_p0/sql_functions/spatial_functions` 通过；`build-support/clang-format.sh` / clang-tidy 通过；FE 改动过 checkstyle。
-
-## 8. 实施计划
-
-
-
-### 8.1 PR 切分
-
-
-| PR        | 内容                                               | 依赖                                               |
-| --------- | ------------------------------------------------ | ------------------------------------------------ |
-| **PR-A1** | Phase A1：关系函数 const 三分支 + UT/回归                  | 无                                                |
-| **PR-B1** | FE：四函数解绑 `BinaryExpression`、新增三参签名               | 无（可与 PR-A1 并行）                                   |
-| **PR-B2** | BE：`use_sphere` API + 二维辅助 + arity + 执行体 + UT/回归 | PR-B1；建议在 PR-A1 合入后进行，避免 `StRelationFunction` 冲突 |
-| **PR-A2** | Phase A2 `ST_GeometryType` 轻量路径 + A3 槽位复用        | 可随时穿插                                            |
-| **PR-A3** | Phase A5：`GeoFunction` open/close prepare 缓存     | PR-A1（复用三分支结构）；建议在 PR-B2 之后，避免三方冲突               |
-
-
-```mermaid
-flowchart LR
-    A1["PR-A1<br/>const 三分支"] --> B2["PR-B2<br/>BE use_sphere 全链路"]
-    B1["PR-B1<br/>FE 三参签名"] --> B2
-    A1 -.独立.-> A2["PR-A2<br/>轻量路径 + 槽位复用"]
-    B2 --> A3["PR-A3<br/>open/close prepare 缓存"]
-```
-
-
-
-
-
-### 8.2 任务清单
-
-
-| ID                    | 内容                                                             | 所属   | 状态      |
-| --------------------- | -------------------------------------------------------------- | ---- | ------- |
-| phase1-relation-const | `StRelationFunction` 三分支 + UT/回归                               | WS-A | pending |
-| phase2-geometry-type  | 编码头读 type_name，`StGeometryType` 去 full decode                  | WS-A | pending |
-| phase2-xy-review      | 复核 `ST_X`/`ST_Y`，保持对外精度语义                                      | WS-A | pending |
-| phase3-loop-reuse     | vector_vector 循环外槽位复用                                          | WS-A | pending |
-| phase5-prepare-cache  | `GeoFunction` open/close + `StContainsState` 启用 + context 链路打通 | WS-A | pending |
-| sphere-fe-signature   | 四 `St*` 解绑 `BinaryExpression` + 三参签名                           | WS-B | pending |
-| sphere-be-api         | `GeoShape` `use_sphere` 重载 + 二维/三维辅助                           | WS-B | pending |
-| sphere-be-arity       | `functions_geo.h` arity 策略落地                                   | WS-B | pending |
-| sphere-be-execute     | 执行体按行分发 2d/3d                                                  | WS-B | pending |
-| sphere-tests          | UT + 回归                                                        | WS-B | pending |
-
-
-
-
-## 9. 风险与应对
-
-
-| 风险                                                          | 等级  | 应对                                                                    |
-| ----------------------------------------------------------- | --- | --------------------------------------------------------------------- |
-| 二维路径与三维路径在边界 case（点在边上、共线、极点/跨反子午线）行为差异未充分定义                | 高   | UT 显式覆盖边界 case；`disjoint == !intersects` 不变式测试兜底；语义以 §5.2 定义为准并写入用户文档 |
-| `SimpleFunctionFactory` 同名多 arity 注册行为与 FE 分发不一致（双注册策略）     | 中   | PR-B2 前先做注册链路 spike；不满足则改用 variadic 特化                                |
-| WS-A 与 WS-B 同时改 `StRelationFunction` 产生合入冲突                 | 中   | §8.1 已约定顺序：A1 先行，B2 基于 A1，A3（prepare 缓存）最后                            |
-| `GeoFunction` 为全部 geo 函数共用模板，`open` 逻辑误挂到不需要缓存的函数           | 中   | 按 Impl trait 分流，仅关系函数启用；UT 覆盖无缓存函数的 open 空路径                          |
-| `ST_GeometryType` 轻量路径与 `GeometryType()` 字符串映射漂移（新增几何类型时漏改） | 低   | 映射集中单一来源；UT 遍历全部类型校验两路径一致                                             |
-| const 侧非法 blob 整列 NULL 与逐行语义在极端场景存在感知差异                     | 低   | 与 `StDistance` 现行为一致，属既有先例；回归用例固化                                     |
-| Nereids 存在隐式依赖 `BinaryExpression` 的规则                       | 低   | PR-B1 全量排查 `instanceof BinaryExpression` 对四类的引用                       |
-
-
-
-
-## 10. 待评审确认项
-
-1. **BE arity 策略**：双注册 vs variadic 特化（§5.4.1），倾向先 spike 双注册。
-2. `DEFAULT_USE_SPHERE` **默认值**：本方案定为 `true`（兼容优先）；是否有长期对齐 PostGIS 平面语义的诉求。
-3. `ST_GeometryType` **对「头部合法、payload 损坏」blob 的行为**（§4.2）：建议接受返回类型名（仅数据损坏场景，语义合理）；若评审要求严格 NULL 对齐，则该优化收益归零，Phase A2 缩减为仅 `ST_X`/`ST_Y` 复核。
-4. **Phase A5 的 context 传递方式**：统一给 `Impl::execute` 加 `FunctionContext`* 参数，还是仅对关系函数做特化模板（后者改动更小，推荐）。
-5. **性能基准口径**：是否要求在 `opensky_p2` 负载上给出量化报告作为 PR-A1 / PR-A3 验收条件。
-
----
-
-
-
-## 附录 A：Phase A1 / A5 / StarRocks 机制对比
-
-
-|      | Doris Phase A1              | Doris Phase A5（本方案）                                       | StarRocks 现有实现                          |
-| ---- | --------------------------- | --------------------------------------------------------- | --------------------------------------- |
-| 检测时机 | execute 内 `unpack_if_const` | `open` 阶段 `is_col_constant()`                             | prepare 阶段 `ctx->is_constant_column()`  |
-| 缓存载体 | 函数内局部变量                     | `FunctionContext` FRAGMENT_LOCAL state（`StContainsState`） | `FunctionContext` FRAGMENT_LOCAL state  |
-| 生命周期 | 单次 execute 调用               | open → execute × N → close，跨 batch                        | prepare → execute → close，跨 batch       |
-| 覆盖范围 | 关系函数                        | 关系函数                                                      | 关系函数、构造函数（`st_circle`、`st_from_wkt`）等通用 |
-
-
-结论：A1 以最小改动获得单 block 收益并搭好三分支结构；A5 在此之上启用 `functions_geo.h` 中遗留的 `StContainsState`，达到与 StarRocks 等价的跨 block 复用。框架侧 `open/close` / 常量列 API / state 挂载均已具备（见 §4.4.1），A5 为纯 Geo 模块内改动。
-
-## 附录 B：参考资料
-
-- `[geo-batch-reuse-plan.md](./geo-batch-reuse-plan.md)` — WS-A 各 Phase 的 SQL/行为示例与 StarRocks 实现详解
-- `[geo-spatial-design.md](./geo-spatial-design.md)` — Geo 现状架构、限制与测试体系
-- `[constant-fold-geo-analysis.md](./constant-fold-geo-analysis.md)` — FE 不对 `st_*` 常量折叠的原因（Doris vs StarRocks）
-- `[架构建议.md](./架构建议.md)` — 分层演进路线（bbox / S2 Cell / 原生类型）
-- 飞书 [GEO二维/三维计算一致性分析](https://pansw43kpjc.feishu.cn/wiki/O4sKw6Z5BiKddRkb1nDcGEc4n0d) — WS-B 方案对比原始材料（方案一已选定）
-- 代码：`be/src/exprs/function/geo/`；回归：`regression-test/suites/query_p0/sql_functions/spatial_functions/`
 
