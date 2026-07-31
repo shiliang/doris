@@ -203,23 +203,7 @@ Phase A1 做完后，A5 的增量改动主要是 `open/close` 和 state 读写�
 
 
 
-### 5.1 为什么不选其他方案
-
-
-| 方案                             | 说明                                          | 优点                                     | 缺点                                             | 结论                      |
-| ------------------------------ | ------------------------------------------- | -------------------------------------- | ---------------------------------------------- | ----------------------- |
-| B-1 函数第三参 `use_sphere`（**选定**） | `st_intersects(g1, g2, use_sphere)`，四函数同步支持 | 表达式级粒度，同一 SQL 可混用两种模式；语义显式、可审计；不依赖会话状态 | 需改 FE 签名 + BE arity，改动面较大                      | **采用**                  |
-| B-2 会话变量统一切换                   | 不改 SQL，`TQueryOptions` 下发布尔开关               | SQL 零改动                                | 无法在同一查询内混用；会话状态隐式影响结果，排障困难；工程上仍需打通 BE 取会话选项的管道 | 本期不做；如后续实施，约定第三参优先于会话变量 |
-| B-3 新函数名（如 `st_intersects_2d`） | 语义并行的函数族                                    | 实现最简单                                  | 函数数量翻倍，签名爆炸；与 OGC 命名习惯不符                       | 否决                      |
-
-
-默认值：两参写法默认 `use_sphere = true`（沿用现有 S2 球面行为），存量查询结果不变。`DEFAULT_USE_SPHERE` 在 BE 用常量集中定义。
-
-> 待评审：默认值是不是长期锚定 `true`。如果以后想对齐 PostGIS 的平面语义（默认 `false`），要走行为变更流程，不在这次方案里。
-
-
-
-### 5.2 SQL 语义定义
+### 5.1 SQL 语义定义
 
 ```sql
 -- 三维球面（显式指定；与现版本默认行为一致）
@@ -236,9 +220,13 @@ SELECT ST_Intersects(g1, g2);
 - 第三参为普通布尔表达式，允许列值（逐行生效）、常量与 NULL；NULL 遵循函数整体的 `AlwaysNullable` / `PropagateNullLiteral` 语义。
 - 语义约束：不管 `use_sphere` 取什么值，`st_disjoint(g1, g2, s) == NOT st_intersects(g1, g2, s)` 必须成立（允许数值误差）。
 
+默认值：两参写法默认 `use_sphere = true`（沿用现有 S2 球面行为），存量查询结果不变。`DEFAULT_USE_SPHERE` 在 BE 用常量集中定义。
+
+> 待评审：默认值是不是长期锚定 `true`。如果以后想对齐 PostGIS 的平面语义（默认 `false`），要走行为变更流程，不在这次方案里。
 
 
-### 5.3 FE 设计
+
+### 5.2 FE 设计
 
 关键点：必须和 `BinaryExpression` 解绑。现在四个 `St`* 类实现的是 `BinaryExpression`（固定两个子节点），和 2/3 参并存是冲突的。改成只继承 `ScalarFunction` + `ExplicitlyCastableSignature` + `AlwaysNullable` + `PropagateNullLiteral`，`withChildren` 允许 2 或 3 个子节点：
 
@@ -286,11 +274,11 @@ FE 改动清单：
 
 
 
-### 5.4 BE 设计
+### 5.3 BE 设计
 
 
 
-#### 5.4.1 函数注册 arity（固定三参，FE 补默认值）
+#### 5.3.1 函数注册 arity（固定三参，FE 补默认值）
 
 FE 在表达式构建阶段把两参写法统一补成三参：`ST_Contains(g1, g2)` → `ST_Contains(g1, g2, true)`，第三参填常量 `DEFAULT_USE_SPHERE`。BE 侧 `NUM_ARGS = 3` 固定，`is_variadic() = false` 不变，不需要双注册或者 variadic 特化：
 
@@ -306,7 +294,7 @@ struct StRelationFunction {
 
 这样 BE 改动最小——不用改 `GeoFunction` 模板，不用动 `SimpleFunctionFactory` 注册，`execute` 里按正常 3 参读第三列就行。
 
-#### 5.4.2 `GeoShape` API
+#### 5.3.2 `GeoShape` API
 
 ```cpp
 // geo_types.h — 签名变更示意
@@ -331,7 +319,7 @@ public:
 
 
 
-#### 5.4.3 二维计算辅助函数（`geo_types.cpp`）
+#### 5.3.3 二维计算辅助函数（`geo_types.cpp`）
 
 
 | 函数                                                                                                 | 算法要点                                               |
@@ -347,11 +335,11 @@ public:
 
 
 
-#### 5.4.4 三维（球面）计算辅助函数（`geo_types.cpp`）
+#### 5.3.4 三维（球面）计算辅助函数（`geo_types.cpp`）
 
 和二维路径不同，球面几何运算主要靠 S2 库。但 S2 的部分 API 在边界场景（线段与多边形环共线、纯边界接触等）有数值精度或方向性 bug，所以也需要几个补充函数来修。这些函数不是简单的 S2 wrapper——它们修的是 S2 处理不了的 edge case。
 
-##### 5.4.4.1 多边形与线段的球面交互
+##### 5.3.4.1 多边形与线段的球面交互
 
 
 | 函数                                  | 调用方                                            | S2 依赖                                | 为什么需要手工补丁                                                                                                   |
@@ -363,7 +351,7 @@ public:
 
 
 
-##### 5.4.4.2 多边形 vs 多边形的边界接触判定
+##### 5.3.4.2 多边形 vs 多边形的边界接触判定
 
 
 | 函数                                     | 调用方                   | S2 依赖                             | 为什么需要手工补丁                                                                   |
@@ -373,7 +361,7 @@ public:
 
 注意：`GeoPolygon::intersects` 在处理 POLYGON × POLYGON 且 `use_sphere=true` 时，直接用 `S2Polygon::Intersects()` 加 `polygon_touch_polygon` 兜底（同上边界漏报问题），没有对应的独立静态辅助函数——该逻辑内联在 `intersects` 方法体中。
 
-##### 5.4.4.3 GeoCircle 的球面方法
+##### 5.3.4.3 GeoCircle 的球面方法
 
 Circle 在 `use_sphere=true` 时通过成员方法 `intersects_sphere` / `touches_sphere` 分发，而非 `_2d` 版的 plane 静态函数。这两个方法虽然是成员函数，但其算法同样值得说明：
 
@@ -386,7 +374,7 @@ Circle 在 `use_sphere=true` 时通过成员方法 `intersects_sphere` / `touche
 
 
 
-##### 5.4.4.4 三维路径的几何基元
+##### 5.3.4.4 三维路径的几何基元
 
 以下函数**不区分 2D/3D**，两种模式共用：
 
@@ -401,7 +389,7 @@ Circle 在 `use_sphere=true` 时通过成员方法 `intersects_sphere` / `touche
 
 
 
-##### 5.4.4.5 与二维函数的映射关系
+##### 5.3.4.5 与二维函数的映射关系
 
 
 | 关系操作                         | 二维辅助函数                              | 三维辅助函数                                                           | 备注                                                |
@@ -418,7 +406,7 @@ Circle 在 `use_sphere=true` 时通过成员方法 `intersects_sphere` / `touche
 
 
 
-#### 5.4.5 执行体
+#### 5.3.5 执行体
 
 第三参逐行读取（列值场景），`ColumnConst` 时提到循环外；不能用 `get_bool(0)` 代表整列：
 
@@ -436,7 +424,7 @@ for (int row = 0; row < size; ++row) {
 
 和 WS-A 的关系：`use_sphere` 是常量列时同样走 const 分支优化，几何常量侧的一次性 decode 和计算模型选择互不影响。
 
-#### 5.4.6 BE 改动清单
+#### 5.3.6 BE 改动清单
 
 
 | 文件                           | 改动                                        | 备注                  |
