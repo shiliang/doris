@@ -21,28 +21,45 @@ import org.apache.doris.analysis.BinaryPredicate;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.InPredicate;
 import org.apache.doris.analysis.IntLiteral;
+import org.apache.doris.analysis.PartitionValue;
 import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.SlotId;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.analysis.TupleId;
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionKey;
 import org.apache.doris.catalog.PrimitiveType;
+import org.apache.doris.catalog.RangePartitionInfo;
+import org.apache.doris.catalog.RangePartitionItem;
 import org.apache.doris.catalog.info.TableNameInfo;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
+import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.thrift.TOlapScanNode;
+import org.apache.doris.thrift.TPaloScanRange;
+import org.apache.doris.thrift.TPartitionBoundary;
+import org.apache.doris.thrift.TScanRange;
+import org.apache.doris.thrift.TScanRangeLocations;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Range;
 import org.apache.commons.collections4.map.CaseInsensitiveMap;
 import org.junit.Assert;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 public class OlapScanNodeTest {
     // columnA in (1) hashmode=3
@@ -210,6 +227,149 @@ public class OlapScanNodeTest {
 
         Assert.assertFalse(ScanNode.containsPartitionPredicate(
                 Lists.newArrayList(partitionSlot.getColumn()), tupleDescriptor, conjuncts, null));
+    }
+
+    @Test
+    public void testRuntimeFilterPartitionBoundariesUsePlanningSnapshot() throws AnalysisException {
+        long oldTargetPartitionId = 1L;
+        long afterPartitionId = 2L;
+        long replacementPartitionId = 3L;
+        Column partitionColumn = new Column("event_date", PrimitiveType.INT);
+        RangePartitionInfo partitionInfo = new RangePartitionInfo(Lists.newArrayList(partitionColumn));
+        setRangePartitionItem(partitionInfo, oldTargetPartitionId, "20260721", "20260722");
+        setRangePartitionItem(partitionInfo, afterPartitionId, "20260722", "20260723");
+
+        OlapTable table = Mockito.mock(OlapTable.class);
+        Mockito.when(table.getName()).thenReturn("rfpp_queue_range_fact");
+        Mockito.when(table.getDistributionColumnNames()).thenReturn(Collections.emptySet());
+        Mockito.when(table.getPartitionInfo()).thenReturn(partitionInfo);
+
+        Map<Long, Partition> livePartitions = new HashMap<>();
+        livePartitions.put(oldTargetPartitionId, mockPartition("p_target"));
+        livePartitions.put(afterPartitionId, mockPartition("p_after"));
+        Mockito.when(table.getPartition(Mockito.anyLong()))
+                .thenAnswer(invocation -> livePartitions.get(invocation.getArgument(0)));
+        Mockito.when(table.getPartitions()).thenAnswer(invocation -> livePartitions.values());
+
+        TupleDescriptor tupleDescriptor = new TupleDescriptor(new TupleId(1));
+        tupleDescriptor.setTable(table);
+        SlotDescriptor partitionSlot = new SlotDescriptor(new SlotId(1), tupleDescriptor.getId());
+        partitionSlot.setColumn(partitionColumn);
+        partitionSlot.setType(partitionColumn.getType());
+        tupleDescriptor.addSlot(partitionSlot);
+
+        OlapScanNode scanNode = new OlapScanNode(
+                new PlanNodeId(1), tupleDescriptor, "rfppScanNode", ScanContext.EMPTY);
+        scanNode.setSelectedPartitionIds(Lists.newArrayList(oldTargetPartitionId, afterPartitionId));
+        scanNode.snapshotSelectedPartitionNames();
+        scanNode.snapshotPartitionBoundariesForRuntimeFilter();
+
+        // Simulate REPLACE PARTITION after planning but before Thrift serialization.
+        partitionInfo.dropPartition(oldTargetPartitionId);
+        setRangePartitionItem(partitionInfo, replacementPartitionId, "20260721", "20260722");
+        livePartitions.remove(oldTargetPartitionId);
+        livePartitions.put(replacementPartitionId, mockPartition("p_target"));
+
+        scanNode.snapshotPartitionBoundariesForRuntimeFilter();
+        TOlapScanNode thriftScanNode = new TOlapScanNode();
+        scanNode.setPartitionBoundariesForRuntimeFilter(thriftScanNode);
+        List<Long> serializedPartitionIds = thriftScanNode.getPartitionBoundaries().stream()
+                .map(TPartitionBoundary::getPartitionId)
+                .collect(Collectors.toList());
+
+        Assert.assertEquals(Lists.newArrayList(oldTargetPartitionId, afterPartitionId), serializedPartitionIds);
+
+        Assert.assertEquals("p_target,p_after", scanNode.getSelectedPartitionNamesForExplain());
+    }
+
+    @Test
+    public void testRuntimeFilterBucketMetadataAttachedOnceAcrossWorkers() throws Exception {
+        OlapScanNode scanNode = newBucketPruneScanNode(10L);
+        TPaloScanRange paloScanRange = scanNode.scanRangeLocations.get(0)
+                .getScanRange().getPaloScanRange();
+        Map<Long, Long> bucketInfo = getBucketInfo(scanNode);
+        bucketInfo.put(10L, ((long) 4 << Integer.SIZE) | 2L);
+
+        scanNode.setRuntimeFilterBucketPruneParameters();
+        bucketInfo.clear();
+        scanNode.setRuntimeFilterBucketPruneParameters();
+
+        Assert.assertEquals(2, paloScanRange.getBucketSeq());
+        Assert.assertEquals(4, paloScanRange.getBucketNum());
+    }
+
+    @Test
+    public void testMissingRuntimeFilterBucketMetadataDisablesScanPruning() throws Exception {
+        OlapScanNode scanNode = newBucketPruneScanNode(10L, 11L);
+        TPaloScanRange firstScanRange = scanNode.scanRangeLocations.get(0)
+                .getScanRange().getPaloScanRange();
+        TPaloScanRange secondScanRange = scanNode.scanRangeLocations.get(1)
+                .getScanRange().getPaloScanRange();
+        Map<Long, Long> bucketInfo = getBucketInfo(scanNode);
+        bucketInfo.put(10L, ((long) 4 << Integer.SIZE) | 2L);
+        bucketInfo.put(11L, ((long) 4 << Integer.SIZE) | 3L);
+
+        boolean previousEnableDebugPoints = Config.enable_debug_points;
+        try {
+            Config.enable_debug_points = true;
+            DebugPointUtil.addDebugPointWithValue(
+                    OlapScanNode.MISSING_RF_BUCKET_METADATA_DEBUG_POINT, 11L);
+
+            scanNode.setRuntimeFilterBucketPruneParameters();
+
+            Assert.assertFalse(firstScanRange.isSetBucketSeq());
+            Assert.assertFalse(firstScanRange.isSetBucketNum());
+            Assert.assertFalse(secondScanRange.isSetBucketSeq());
+            Assert.assertFalse(secondScanRange.isSetBucketNum());
+        } finally {
+            DebugPointUtil.removeDebugPoint(OlapScanNode.MISSING_RF_BUCKET_METADATA_DEBUG_POINT);
+            Config.enable_debug_points = previousEnableDebugPoints;
+        }
+    }
+
+    private OlapScanNode newBucketPruneScanNode(long... tabletIds) {
+        OlapTable table = Mockito.mock(OlapTable.class);
+        Mockito.when(table.getName()).thenReturn("rf_bucket_fact");
+        Mockito.when(table.getDistributionColumnNames()).thenReturn(Collections.emptySet());
+
+        TupleDescriptor tupleDescriptor = new TupleDescriptor(new TupleId(1));
+        tupleDescriptor.setTable(table);
+        OlapScanNode scanNode = new OlapScanNode(
+                new PlanNodeId(1), tupleDescriptor, "rfBucketScanNode", ScanContext.EMPTY);
+        for (long tabletId : tabletIds) {
+            TPaloScanRange paloScanRange = new TPaloScanRange();
+            paloScanRange.setTabletId(tabletId);
+            TScanRange scanRange = new TScanRange();
+            scanRange.setPaloScanRange(paloScanRange);
+            TScanRangeLocations locations = new TScanRangeLocations();
+            locations.setScanRange(scanRange);
+            scanNode.scanRangeLocations.add(locations);
+        }
+        return scanNode;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<Long, Long> getBucketInfo(OlapScanNode scanNode) throws Exception {
+        java.lang.reflect.Field bucketInfoField =
+                OlapScanNode.class.getDeclaredField("tabletId2BucketInfo");
+        bucketInfoField.setAccessible(true);
+        return (Map<Long, Long>) bucketInfoField.get(scanNode);
+    }
+
+    private Partition mockPartition(String name) {
+        Partition partition = Mockito.mock(Partition.class);
+        Mockito.when(partition.getName()).thenReturn(name);
+        return partition;
+    }
+
+    private void setRangePartitionItem(RangePartitionInfo partitionInfo, long partitionId,
+            String lowerValue, String upperValue) throws AnalysisException {
+        List<Column> partitionColumns = partitionInfo.getPartitionColumns();
+        PartitionKey lower = PartitionKey.createPartitionKey(
+                Lists.newArrayList(new PartitionValue(lowerValue)), partitionColumns);
+        PartitionKey upper = PartitionKey.createPartitionKey(
+                Lists.newArrayList(new PartitionValue(upperValue)), partitionColumns);
+        partitionInfo.setItem(partitionId, false, new RangePartitionItem(Range.closedOpen(lower, upper)));
     }
 
     private SlotDescriptor addSlot(TupleDescriptor tupleDescriptor, int slotId, String columnName) {

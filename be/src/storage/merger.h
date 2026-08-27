@@ -37,7 +37,9 @@ class SegmentWriter;
 } // namespace segment_v2
 
 class RowSourcesBuffer;
+class ReadSchema;
 class VerticalBlockReader;
+struct VerticalCompactionContextStats;
 
 using VerticalCompactionProgressCallback =
         std::function<void(int64_t total_groups, int64_t completed_groups)>;
@@ -85,12 +87,11 @@ public:
             RowsetWriter* dst_rowset_writer, uint32_t max_rows_per_segment,
             Statistics* stats_output, std::vector<uint32_t> key_group_cluster_key_idxes,
             int64_t batch_size, CompactionSampleInfo* sample_info,
-            bool enable_sparse_optimization = false);
+            VerticalCompactionContextStats* context_stats, bool enable_sparse_optimization = false);
 
     // for segcompaction
     static Status vertical_compact_one_group(
-            int64_t tablet_id, ReaderType reader_type, const TabletSchema& tablet_schema,
-            bool is_key, const std::vector<uint32_t>& column_group,
+            int64_t tablet_id, ReaderType reader_type, const ReadSchema& read_schema, bool is_key,
             RowSourcesBuffer* row_source_buf, VerticalBlockReader& src_block_reader,
             segment_v2::SegmentWriter& dst_segment_writer, Statistics* stats_output,
             uint64_t* index_size, KeyBoundsPB& key_bounds, SimpleRowIdConversion* rowid_conversion);

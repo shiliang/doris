@@ -136,6 +136,7 @@ CONF_mInt32(scan_instances_interval_seconds, "60"); // 1min
 CONF_mInt32(check_object_interval_seconds, "43200"); // 12hours
 // enable recycler metrics statistics
 CONF_Bool(enable_recycler_stats_metrics, "false");
+CONF_mBool(retain_deleted_instance_tombstone, "true");
 
 CONF_mInt64(check_recycle_task_interval_seconds, "600"); // 10min
 CONF_mInt64(recycler_sleep_before_scheduling_seconds, "60");
@@ -207,7 +208,9 @@ CONF_Int64(default_max_qps_limit, "1000000");
 CONF_String(specific_max_qps_limit, "get_cluster:5000000;begin_txn:5000000");
 CONF_Bool(enable_rate_limit, "true");
 CONF_Int64(bvar_qps_update_second, "5");
-CONF_mBool(enable_ms_rate_limit, "false");
+CONF_mBool(enable_ms_rate_limit, "true");
+// Collect rate-limit trigger metrics independently of rate-limit enforcement.
+CONF_mBool(enable_ms_rate_limit_dry_run, "true");
 // Fault injection: randomly return meta service rate limit error for testing.
 // ms_rate_limit_injection_probability is the probability (0-100) of injecting a rate limit error.
 CONF_mBool(enable_ms_rate_limit_injection, "false");
@@ -282,6 +285,9 @@ CONF_mBool(enable_s3_rate_limiter, "false");
 // s3_rate_limit_inject_probility is the probability (0-100) of injecting a rate limit error.
 CONF_mBool(enable_s3_rate_limit_inject, "false");
 CONF_mInt32(s3_rate_limit_inject_probility, "30");
+// Log active S3 rate limiter every N throttled/rejected requests, 0 means no log.
+CONF_mInt64(s3_rate_limiter_log_interval, "1000");
+CONF_Validator(s3_rate_limiter_log_interval, [](int64_t config) -> bool { return config >= 0; });
 CONF_mInt64(s3_get_bucket_tokens, "1000000000000000000");
 CONF_Validator(s3_get_bucket_tokens, [](int64_t config) -> bool { return config > 0; });
 
@@ -311,8 +317,8 @@ CONF_mBool(enable_load_txn_status_check, "true");
 CONF_mBool(enable_tablet_job_check, "true");
 
 CONF_mBool(enable_recycle_delete_rowset_key_check, "true");
-CONF_mBool(enable_mark_delete_rowset_before_recycle, "true");
-CONF_mBool(enable_abort_txn_and_job_for_delete_rowset_before_recycle, "true");
+CONF_mBool(enable_mark_delete_rowset_before_recycle, "false");
+CONF_mBool(enable_abort_txn_and_job_for_delete_rowset_before_recycle, "false");
 
 // Declare a selection strategy for those servers have many ips.
 // Note that there should at most one ip match this list.
@@ -324,16 +330,14 @@ CONF_String(priority_networks, "");
 
 CONF_Bool(enable_cluster_name_check, "false");
 
-// http scheme in S3Client to use. E.g. http or https
-CONF_String(s3_client_http_scheme, "http");
+// Default HTTP scheme used by S3Client when the endpoint has no scheme.
+CONF_String(s3_client_http_scheme, "https");
 CONF_Validator(s3_client_http_scheme, [](const std::string& config) -> bool {
     return config == "http" || config == "https";
 });
 
 // Max retry times for object storage request
 CONF_mInt64(max_s3_client_retry, "10");
-// Whether to retry on S3 SlowDown (429/503) errors
-CONF_Bool(s3_client_retry_slow_down, "false");
 
 // Max byte getting delete bitmap can return, default is 1GB
 CONF_mInt64(max_get_delete_bitmap_byte, "1073741824");

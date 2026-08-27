@@ -18,6 +18,7 @@
 #ifndef DORIS_BE_SRC_OLAP_ROWSET_ROWSET_READER_CONTEXT_H
 #define DORIS_BE_SRC_OLAP_ROWSET_ROWSET_READER_CONTEXT_H
 
+#include <set>
 #include <vector>
 
 #include "exprs/score_runtime.h"
@@ -29,6 +30,7 @@
 #include "storage/olap_common.h"
 #include "storage/predicate/column_predicate.h"
 #include "storage/rowid_conversion.h"
+#include "storage/schema.h"
 
 namespace doris {
 
@@ -39,10 +41,10 @@ class TabletSchema;
 
 struct RowsetReaderContext {
     ReaderType reader_type = ReaderType::READER_QUERY;
+    bool read_row_binlog = false;
     Version version {-1, -1};
     TabletSchemaSPtr tablet_schema = nullptr;
     std::vector<int> topn_filter_source_node_ids;
-    int topn_filter_target_node_id = -1;
     // whether rowset should return ordered rows.
     bool need_ordered_result = true;
     // used for special optimization for query : ORDER BY key DESC LIMIT n
@@ -50,13 +52,11 @@ struct RowsetReaderContext {
     // For rows with the same key, use ascending order (small-to-large) for tie-breakers.
     // For example, use lower rowset version / segment id first.
     bool use_insert_order_when_same = false;
-    bool force_key_ordered_read = false;
-    // columns for orderby keys
+    // ordinals (positions in read_schema) of the orderby key columns
     std::vector<uint32_t>* read_orderby_key_columns = nullptr;
     // limit of rows for read_orderby_key
     size_t read_orderby_key_limit = 0;
-    // projection columns: the set of columns rowset reader should return
-    const std::vector<uint32_t>* return_columns = nullptr;
+    ReadSchemaSPtr read_schema = nullptr;
     TPushAggOp::type push_down_agg_type_opt = TPushAggOp::NONE;
     // column name -> column predicate
     // adding column_name for predicate to make use of column selectivity
@@ -72,14 +72,12 @@ struct RowsetReaderContext {
     RuntimeState* runtime_state = nullptr;
     VExprContextSPtrs common_expr_ctxs_push_down;
     bool use_page_cache = false;
-    int sequence_id_idx = -1;
+    // Whether equal-key merge should use the sequence column as its tie-break column.
+    bool use_sequence_column_for_merge_order = true;
     int batch_size = 1024;
     // Effective adaptive batch size byte budget. 0 means disabled internally.
     size_t preferred_block_size_bytes = 8388608UL;
 
-    // Points to the "true" output column list before non-direct-mode expansion.
-    // Used by BlockReader to map expanded storage columns back to the requested output layout.
-    const std::vector<ColumnId>* origin_return_columns = nullptr;
     bool is_unique = false;
     //record row num merged in generic iterator
     uint64_t* merged_rows = nullptr;
@@ -89,15 +87,15 @@ struct RowsetReaderContext {
     bool record_rowids = false;
     RowIdConversion* rowid_conversion = nullptr;
     bool is_key_column_group = false;
+    // column unique ids referenced by output/orderby exprs (NOT ordinals)
     const std::set<int32_t>* output_columns = nullptr;
+    std::set<ColumnId> extra_columns;
     RowsetId rowset_id;
     // slots that cast may be eliminated in storage layer
     std::map<std::string, DataTypePtr> target_cast_type_for_variants;
     int64_t ttl_seconds = 0;
 
     std::map<ColumnId, VExprContextSPtr> virtual_column_exprs;
-    std::map<ColumnId, size_t> vir_cid_to_idx_in_block;
-    std::map<size_t, DataTypePtr> vir_col_idx_to_type;
 
     std::map<int32_t, TColumnAccessPaths> all_access_paths;
     std::map<int32_t, TColumnAccessPaths> predicate_access_paths;

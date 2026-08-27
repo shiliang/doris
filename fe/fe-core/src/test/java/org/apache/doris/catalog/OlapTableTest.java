@@ -53,6 +53,42 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 public class OlapTableTest {
 
     @Test
+    public void testGetTableStatusStatsUsesSinglePassSemantics() {
+        OlapTable olapTable = new OlapTable();
+        MaterializedIndex index = new MaterializedIndex(10, MaterializedIndex.IndexState.NORMAL);
+        index.setRowCount(20);
+
+        List<Replica> replicas = Lists.newArrayList(
+                mockReplica(Replica.ReplicaState.NORMAL, 10, 100, 1, 20, 2),
+                mockReplica(Replica.ReplicaState.DECOMMISSION, 30, 300, 3, 40, 4),
+                mockReplica(Replica.ReplicaState.NORMAL, 50, 500, 5, 60, 6));
+        Tablet tablet = Mockito.mock(Tablet.class);
+        Mockito.when(tablet.getReplicas()).thenReturn(replicas);
+        index.appendTablets(Lists.newArrayList(tablet));
+
+        Partition partition = new Partition(11, "p1", index, null);
+        olapTable.addPartition(partition);
+
+        TableIf.TableStatusStats stats = olapTable.getTableStatusStats();
+        Assert.assertEquals(20L, stats.getRows());
+        Assert.assertEquals(909L, stats.getDataLength());
+        Assert.assertEquals(3L, stats.getAvgRowLength());
+        Assert.assertEquals(132L, stats.getIndexLength());
+    }
+
+    private Replica mockReplica(Replica.ReplicaState state, long dataSize, long localSegmentSize,
+            long remoteSegmentSize, long localIndexSize, long remoteIndexSize) {
+        Replica replica = Mockito.mock(Replica.class);
+        Mockito.when(replica.getState()).thenReturn(state);
+        Mockito.when(replica.getDataSize()).thenReturn(dataSize);
+        Mockito.when(replica.getLocalSegmentSize()).thenReturn(localSegmentSize);
+        Mockito.when(replica.getRemoteSegmentSize()).thenReturn(remoteSegmentSize);
+        Mockito.when(replica.getLocalInvertedIndexSize()).thenReturn(localIndexSize);
+        Mockito.when(replica.getRemoteInvertedIndexSize()).thenReturn(remoteIndexSize);
+        return replica;
+    }
+
+    @Test
     public void test() throws IOException {
 
         try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class, Mockito.CALLS_REAL_METHODS)) {
@@ -131,6 +167,35 @@ public class OlapTableTest {
         Assert.assertTrue(olapTable.getTableProperty().getDynamicPartitionProperty().isExist());
         Assert.assertFalse(olapTable.getTableProperty().getDynamicPartitionProperty().getEnable());
         Assert.assertEquals((short) 3, olapTable.getDefaultReplicaAllocation().getTotalReplicaNum());
+    }
+
+    @Test
+    public void testBfIndexTableLevelFppDoesNotAffectSignature() throws IOException {
+        try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class, Mockito.CALLS_REAL_METHODS)) {
+            mockedEnv.when(Env::getCurrentEnvJournalVersion).thenReturn(FeConstants.meta_version);
+
+            Database db = UnitTestUtil.createDb(11, 12, 13, 14, 15, 16, 17);
+            OlapTable olapTable = null;
+            for (Table table : db.getTables()) {
+                if (table.getType() == TableType.OLAP) {
+                    olapTable = (OlapTable) table;
+                    break;
+                }
+            }
+            Assert.assertNotNull(olapTable);
+
+            olapTable.setIndexes(Lists.newArrayList(new Index(1L, "bf_v1", Lists.newArrayList("v1"),
+                    IndexType.BLOOMFILTER, null, "")));
+
+            List<String> partNames = Lists.newArrayList(olapTable.getPartitionNames());
+            olapTable.setBloomFilterInfo(null, 0.01);
+            String signatureWithFpp001 = olapTable.getSignature(1, partNames);
+
+            olapTable.setBloomFilterInfo(null, 0.02);
+            String signatureWithFpp002 = olapTable.getSignature(1, Lists.newArrayList(olapTable.getPartitionNames()));
+
+            Assert.assertEquals(signatureWithFpp001, signatureWithFpp002);
+        }
     }
 
     @Test

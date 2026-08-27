@@ -21,6 +21,7 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.UserException;
 import org.apache.doris.persist.EditLog;
+import org.apache.doris.thrift.TWorkloadMetricType;
 
 import org.junit.After;
 import org.junit.Assert;
@@ -90,20 +91,7 @@ public class WorkloadSchedPolicyMgrTest {
             Assert.fail("Should not throw exception for mixed USERNAME and BE metrics: " + e.getMessage());
         }
 
-        // Case 2: USERNAME (Shared) + FE Action -> OK
-        try {
-            List<WorkloadConditionMeta> conditionMetas = new ArrayList<>();
-            conditionMetas.add(new WorkloadConditionMeta("username", "=", "user1"));
-
-            List<WorkloadActionMeta> actionMetas = new ArrayList<>();
-            actionMetas.add(new WorkloadActionMeta("set_session_variable", "workload_group=normal"));
-
-            mgr.createWorkloadSchedPolicy("policy_fe_only", false, conditionMetas, actionMetas, null);
-        } catch (UserException e) {
-            Assert.fail("Should not throw exception for USERNAME + FE Action: " + e.getMessage());
-        }
-
-        // Case 3: USERNAME (Shared) + BE Action -> OK
+        // Case 2: USERNAME (Shared) + BE Action -> OK
         try {
             List<WorkloadConditionMeta> conditionMetas = new ArrayList<>();
             conditionMetas.add(new WorkloadConditionMeta("username", "=", "user1"));
@@ -115,34 +103,15 @@ public class WorkloadSchedPolicyMgrTest {
         } catch (UserException e) {
             Assert.fail("Should not throw exception for USERNAME + BE Action: " + e.getMessage());
         }
+    }
 
-        // Case 4: BE Metric + FE Action -> Error
+    @Test
+    public void testSetSessionVariableActionIsRejected() {
         try {
-            List<WorkloadConditionMeta> conditionMetas = new ArrayList<>();
-            conditionMetas.add(new WorkloadConditionMeta("query_time", ">", "1000"));
-
-            List<WorkloadActionMeta> actionMetas = new ArrayList<>();
-            actionMetas.add(new WorkloadActionMeta("set_session_variable", "workload_group=normal"));
-
-            mgr.createWorkloadSchedPolicy("policy_error_1", false, conditionMetas, actionMetas, null);
-            Assert.fail("Should throw exception for BE Metric + FE Action");
+            new WorkloadActionMeta("set_session_variable", "workload_group=normal");
+            Assert.fail("Should throw exception for removed set_session_variable action");
         } catch (UserException e) {
-            Assert.assertTrue(e.getMessage().contains("action and metric must run in FE together or run in BE together"));
-        }
-
-        // Case 5: USERNAME + BE Metric + FE Action -> Error
-        try {
-            List<WorkloadConditionMeta> conditionMetas = new ArrayList<>();
-            conditionMetas.add(new WorkloadConditionMeta("username", "=", "user1"));
-            conditionMetas.add(new WorkloadConditionMeta("query_time", ">", "1000"));
-
-            List<WorkloadActionMeta> actionMetas = new ArrayList<>();
-            actionMetas.add(new WorkloadActionMeta("set_session_variable", "workload_group=normal"));
-
-            mgr.createWorkloadSchedPolicy("policy_error_2", false, conditionMetas, actionMetas, null);
-            Assert.fail("Should throw exception for USERNAME + BE Metric + FE Action");
-        } catch (UserException e) {
-            Assert.assertTrue(e.getMessage().contains("action and metric must run in FE together or run in BE together"));
+            Assert.assertTrue(e.getMessage().contains("invalid action type set_session_variable"));
         }
     }
 
@@ -341,6 +310,34 @@ public class WorkloadSchedPolicyMgrTest {
                     e.getMessage().contains("<workload_group>"));
             Assert.assertTrue("message should mention non-cloud mode; got: " + e.getMessage(),
                     e.getMessage().contains("non-cloud mode"));
+        }
+    }
+
+    @Test
+    public void testRemoteScanBytesMetricCanCreateBePolicy() throws UserException {
+        List<WorkloadConditionMeta> conditionMetas = new ArrayList<>();
+        // Verify the new metric string can be parsed into a BE-side workload condition.
+        conditionMetas.add(new WorkloadConditionMeta("be_scan_bytes_from_remote_storage", ">", "100"));
+        List<WorkloadActionMeta> actionMetas = new ArrayList<>();
+        actionMetas.add(new WorkloadActionMeta("cancel_query", ""));
+
+        mgr.createWorkloadSchedPolicy("policy_remote_scan_bytes", false, conditionMetas, actionMetas, null);
+
+        Assert.assertTrue(WorkloadSchedPolicyMgr.BE_METRIC_SET.contains(
+                WorkloadMetricType.BE_SCAN_BYTES_FROM_REMOTE_STORAGE));
+        Assert.assertEquals(TWorkloadMetricType.BE_SCAN_BYTES_FROM_REMOTE_STORAGE,
+                WorkloadSchedPolicyMgr.METRIC_MAP.get(WorkloadMetricType.BE_SCAN_BYTES_FROM_REMOTE_STORAGE));
+    }
+
+    @Test
+    public void testRemoteScanBytesMetricRejectsNegativeValue() throws UserException {
+        try {
+            // Reject negative thresholds for the remote scan bytes breaker.
+            WorkloadCondition.createWorkloadCondition(
+                    new WorkloadConditionMeta("be_scan_bytes_from_remote_storage", ">", "-1"));
+            Assert.fail("Should throw exception for negative remote scan bytes value");
+        } catch (UserException e) {
+            Assert.assertTrue(e.getMessage().contains("remote scan bytes"));
         }
     }
 }

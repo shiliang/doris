@@ -47,6 +47,7 @@ import org.apache.doris.nereids.trees.plans.algebra.OlapScan;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.rpc.RpcException;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -206,6 +207,20 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
     }
 
     /**
+     * Constructor for LogicalOlapScan.
+     */
+    public LogicalOlapScan(RelationId id, OlapTable table, List<String> qualifier, List<Long> tabletIds,
+                           List<String> hints, Optional<TableSample> tableSample, Collection<Slot> operativeSlots,
+                           Optional<TableScanParams> scanParams) {
+        this(id, table, qualifier, Optional.empty(), Optional.empty(),
+                table.getPartitionIds(), false, false, tabletIds,
+                -1, false, PreAggStatus.unset(), ImmutableList.of(), hints, Maps.newHashMap(), Optional.empty(),
+                tableSample, false, ImmutableMap.of(), ImmutableList.of(), operativeSlots,
+                ImmutableList.of(), ImmutableList.of(), Optional.empty(), Optional.empty(),
+                ImmutableList.of(), Optional.empty(), "", Optional.empty(), scanParams);
+    }
+
+    /**
      * constructor.
      */
     public LogicalOlapScan(RelationId id, OlapTable table, List<String> qualifier, List<Long> specifiedPartitions,
@@ -217,6 +232,21 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
                 tableSample, false, ImmutableMap.of(), ImmutableList.of(), operativeSlots,
                 ImmutableList.of(), ImmutableList.of(), Optional.empty(), Optional.empty(),
                 ImmutableList.of(), Optional.empty(), "");
+    }
+
+    /**
+     * Constructor for LogicalOlapScan.
+     */
+    public LogicalOlapScan(RelationId id, OlapTable table, List<String> qualifier, List<Long> specifiedPartitions,
+                           List<Long> tabletIds, List<String> hints, Optional<TableSample> tableSample,
+                           List<Slot> operativeSlots, Optional<TableScanParams> scanParams) {
+        this(id, table, qualifier, Optional.empty(), Optional.empty(),
+                // must use specifiedPartitions here for prune partition by sql like 'select * from t partition p1'
+                specifiedPartitions, false, false, tabletIds,
+                -1, false, PreAggStatus.unset(), specifiedPartitions, hints, Maps.newHashMap(), Optional.empty(),
+                tableSample, false, ImmutableMap.of(), ImmutableList.of(), operativeSlots,
+                ImmutableList.of(), ImmutableList.of(), Optional.empty(), Optional.empty(),
+                ImmutableList.of(), Optional.empty(), "", Optional.empty(), scanParams);
     }
 
     /**
@@ -233,6 +263,22 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
                 ImmutableList.of(), operativeSlots, ImmutableList.of(), ImmutableList.of(),
                 Optional.empty(), Optional.empty(),
                 ImmutableList.of(), Optional.empty(), "");
+    }
+
+    /**
+     * constructor.
+     */
+    public LogicalOlapScan(RelationId id, OlapTable table, List<String> qualifier, List<Long> tabletIds,
+                           List<Long> selectedPartitionIds, long selectedIndexId, PreAggStatus preAggStatus,
+                           List<Long> specifiedPartitions, List<String> hints, Optional<TableSample> tableSample,
+                           Collection<Slot> operativeSlots, Optional<TableScanParams> scanParams) {
+        this(id, table, qualifier, Optional.empty(), Optional.empty(),
+                selectedPartitionIds, false, false, tabletIds,
+                selectedIndexId, true, preAggStatus,
+                specifiedPartitions, hints, Maps.newHashMap(), Optional.empty(), tableSample, true, ImmutableMap.of(),
+                ImmutableList.of(), operativeSlots, ImmutableList.of(), ImmutableList.of(),
+                Optional.empty(), Optional.empty(),
+                ImmutableList.of(), Optional.empty(), "", Optional.empty(), scanParams);
     }
 
     /**
@@ -759,17 +805,13 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
             return getOutputByIndex(selectedIndexId);
         }
         List<Column> baseSchema = table.getBaseSchema(true);
-        boolean skipBinlogBeforeColumn = scanParams.isPresent() && scanParams.get().incrementalRead();
-        List<SlotReference> slotFromColumn = createSlotsVectorized(baseSchema, skipBinlogBeforeColumn);
+        List<SlotReference> slotFromColumn = createSlotsVectorized(baseSchema);
 
         Builder<Slot> slots = ImmutableList.builder();
         IdGenerator<ExprId> exprIdGenerator = StatementScopeIdGenerator.getExprIdGenerator();
         for (int i = 0; i < baseSchema.size(); i++) {
             final int index = i;
             Column col = baseSchema.get(i);
-            if (skipBinlogBeforeColumn && col.getName().startsWith(Column.BINLOG_BEFORE_PREFIX)) {
-                continue;
-            }
             Pair<Long, String> key = Pair.of(selectedIndexId, col.getName());
             Slot slot = cacheSlotWithSlotName.computeIfAbsent(key, k -> slotFromColumn.get(index));
             slots.add(slot);
@@ -887,22 +929,31 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
         return scoreRangeInfo;
     }
 
-    private List<SlotReference> createSlotsVectorized(List<Column> columns, boolean skipBinlogBeforeColumn) {
+    protected List<SlotReference> createSlotsVectorized(List<Column> columns) {
         List<String> qualified = qualified();
         SlotReference[] slots = new SlotReference[columns.size()];
         IdGenerator<ExprId> exprIdGenerator = StatementScopeIdGenerator.getExprIdGenerator();
         for (int i = 0; i < columns.size(); i++) {
-            if (skipBinlogBeforeColumn && columns.get(i).getName().startsWith(Column.BINLOG_BEFORE_PREFIX)) {
-                continue;
-            }
             ExprId nextId = exprIdGenerator.getNextId();
-            slots[i] = SlotReference.fromColumn(nextId, table, columns.get(i), qualified);
+            slots[i] = SlotReference.fromColumn(nextId, table, getOutputColumn(columns.get(i)), qualified);
         }
         return Arrays.asList(slots);
     }
 
-    protected List<SlotReference> createSlotsVectorized(List<Column> columns) {
-        return createSlotsVectorized(columns, false);
+    /**
+     * BE needs the {@code __BEFORE__} columns to build before-images on an {@code @incr} read, but
+     * they are storage bookkeeping: {@code SELECT * FROM t@incr(...)} should return t's own columns,
+     * not the mirrors behind them. The flag is set on a copy because these Column instances belong
+     * to the table's persisted metadata and are shared across statements.
+     */
+    private Column getOutputColumn(Column column) {
+        if (scanParams.isPresent() && scanParams.get().incrementalRead()
+                && column.getName().startsWith(Column.BINLOG_BEFORE_PREFIX)) {
+            Column outputColumn = new Column(column);
+            outputColumn.setIsVisible(false);
+            return outputColumn;
+        }
+        return column;
     }
 
     @Override
@@ -918,6 +969,27 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
 
     @Override
     public void computeUnique(DataTrait.Builder builder) {
+        // Duplicate-producing scan modes invalidate all uniqueness
+        // guarantees regardless of table metadata or declared constraints.
+        // When the BE returns unmerged versions or duplicate key rows, the
+        // WinMagic window-function rewrite (and any other rule relying on
+        // uniqueness) would produce wrong results.
+        if (isDuplicateProducingScanMode()) {
+            return;
+        }
+        // Raw-version reads expose superseded rows: with skipDeleteBitmap, rows replaced by
+        // later versions are read; with read_mor_as_dup_tables, MOR tables are read as DUP and
+        // expose every version. Uniqueness — including the table-level constraints imported by
+        // super.computeUnique() — does not hold for the data actually read, so suppress it here
+        // before super runs; otherwise the raw-version guard below would return after the
+        // constraint was already registered.
+        if (getTable().getKeysType() == KeysType.UNIQUE_KEYS
+                && (ConnectContext.get().getSessionVariable().skipDeleteBitmap
+                    || (getTable().isMorTable()
+                        && ConnectContext.get().getSessionVariable().isReadMorAsDupEnabled(
+                            getTable().getQualifiedDbName(), getTable().getName())))) {
+            return;
+        }
         super.computeUnique(builder);
         if (this.selectedIndexId != getTable().getBaseIndexId()) {
             /*
@@ -944,6 +1016,13 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
                 the mv2's agg key citycode * citycode is not unique
 
                 for simplicity, we disable unique compute for mv
+
+                Declared constraints from super.computeUnique(builder) were
+                already filtered by findSlotsByColumn() above: if a rollup
+                does not include ALL columns of a PRIMARY KEY / UNIQUE
+                constraint, the partial-column set is discarded.  Only
+                constraints whose full column set is present in the scan
+                output are propagated.
              */
             return;
         }
@@ -965,19 +1044,8 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
             builder.addUniqueSlot(originalPlan.getLogicalProperties().getTrait());
             builder.replaceUniqueBy(constructReplaceMap(mtmv));
         } else if (getTable().getKeysType().isAggregationFamily() && !getTable().isRandomDistribution()) {
-            // When skipDeleteBitmap is set to true, in the unique model, rows that are replaced due to having the same
-            // unique key will also be read. As a result, the uniqueness of the unique key cannot be guaranteed.
-            if (ConnectContext.get().getSessionVariable().skipDeleteBitmap
-                    && getTable().getKeysType() == KeysType.UNIQUE_KEYS) {
-                return;
-            }
-            // When readMorAsDup is enabled, MOR tables are read as DUP, so uniqueness cannot be guaranteed.
-            if (getTable().getKeysType() == KeysType.UNIQUE_KEYS
-                    && getTable().isMorTable()
-                    && ConnectContext.get().getSessionVariable().isReadMorAsDupEnabled(
-                        getTable().getQualifiedDbName(), getTable().getName())) {
-                return;
-            }
+            // raw-version guards (skipDeleteBitmap / read_mor_as_dup_tables) are checked at the
+            // top of this method, before super.computeUnique() imports table-level constraints
             ImmutableSet.Builder<Slot> uniqSlots = ImmutableSet.builderWithExpectedSize(outputSet.size());
             for (Slot slot : outputSet) {
                 if (!(slot instanceof SlotReference)) {
@@ -1053,6 +1121,51 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
             builder.addFuncDepsDG(originalPlan.getLogicalProperties().getTrait());
             builder.replaceFuncDepsBy(constructReplaceMap(mtmv));
         }
+    }
+
+    /**
+     * Whether the scan is configured with a session variable or scan
+     * mode that makes the BE return potentially duplicate rows even for
+     * declared unique keys.  In these modes any uniqueness guarantee —
+     * whether from OLAP key metadata or from user-declared PRIMARY KEY /
+     * UNIQUE constraints — is unreliable.
+     */
+    private boolean isDuplicateProducingScanMode() {
+        SessionVariable sv = ConnectContext.get().getSessionVariable();
+        // skipStorageEngineMerge: BE returns unmerged versions — all
+        // table types may have duplicate key rows.
+        if (sv.skipStorageEngineMerge) {
+            return true;
+        }
+        // skipDeleteBitmap: on UNIQUE_KEYS tables, rows that were replaced
+        // due to the same key are also read, so the key duplicates.
+        if (sv.skipDeleteBitmap && getTable().getKeysType() == KeysType.UNIQUE_KEYS) {
+            return true;
+        }
+        // readMorAsDup: MOW tables are read as DUPLICATE — uniqueness
+        // of the declared key is not guaranteed.
+        if (getTable().getKeysType() == KeysType.UNIQUE_KEYS
+                && getTable().isMorTable()
+                && sv.isReadMorAsDupEnabled(
+                    getTable().getQualifiedDbName(), getTable().getName())) {
+            return true;
+        }
+        // Stream scans and other scan subclasses that can return duplicate
+        // key rows are handled via producesDuplicateRows() which defaults
+        // to false and is overridden by subclasses with special semantics.
+        // This follows the Open/Closed principle: adding a new scan subclass
+        // with duplicate-producing behavior does not require modifying
+        // LogicalOlapScan.
+        if (producesDuplicateRows()) {
+            return true;
+        }
+        // Row-binlog incremental scan (TableScanParams.INCREMENTAL_READ):
+        // same hazard as the stream-scan case — the scan returns rows
+        // keyed by binlog position and duplicate key rows are possible.
+        if (scanParams.isPresent() && scanParams.get().incrementalRead()) {
+            return true;
+        }
+        return false;
     }
 
     @Override
@@ -1163,15 +1276,46 @@ public class LogicalOlapScan extends LogicalCatalogRelation implements OlapScan,
     }
 
     @Override
+    protected boolean hasSameScanState(LogicalCatalogRelation other) {
+        if (!Utils.isSameClass(this, other)) {
+            return false;
+        }
+        LogicalOlapScan that = (LogicalOlapScan) other;
+        return selectedIndexId == that.selectedIndexId
+                && indexSelected == that.indexSelected
+                && Objects.equals(selectedPartitionIds, that.selectedPartitionIds)
+                && Objects.equals(manuallySpecifiedPartitions, that.manuallySpecifiedPartitions)
+                && Objects.equals(selectedTabletIds, that.selectedTabletIds)
+                && Objects.equals(manuallySpecifiedTabletIds, that.manuallySpecifiedTabletIds)
+                && Objects.equals(tableSample, that.tableSample)
+                && hasSameScanParams(scanParams, that.scanParams);
+    }
+
+    @Override
     public boolean supportPruneNestedColumn() {
         return true;
     }
 
-    public boolean isIncrementalScan() {
-        return false;
-    }
-
     public Optional<TableScanParams> getScanParams() {
         return scanParams;
+    }
+
+    private boolean hasSameScanParams(Optional<TableScanParams> left, Optional<TableScanParams> right) {
+        if (!left.isPresent() || !right.isPresent()) {
+            return left.isPresent() == right.isPresent();
+        }
+        return Objects.equals(left.get().getParamType(), right.get().getParamType())
+                && Objects.equals(left.get().getMapParams(), right.get().getMapParams())
+                && Objects.equals(left.get().getListParams(), right.get().getListParams());
+    }
+
+    /**
+     * Override point for scan subclasses that can return duplicate rows
+     * even for declared unique keys.  The base {@code LogicalOlapScan}
+     * returns {@code false}; subclasses that introduce special scan modes
+     * (e.g. incremental stream scans) override this to return {@code true}.
+     */
+    protected boolean producesDuplicateRows() {
+        return false;
     }
 }

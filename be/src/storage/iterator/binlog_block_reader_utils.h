@@ -20,10 +20,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <string>
-#include <string_view>
 
-#include "core/block/block.h"
 #include "storage/binlog.h"
 
 namespace doris::binlog {
@@ -34,27 +31,6 @@ constexpr int64_t STREAM_CHANGE_INSERT = 0;
 constexpr int64_t STREAM_CHANGE_DELETE = 1;
 constexpr int64_t STREAM_CHANGE_UPDATE_BEFORE = 2;
 constexpr int64_t STREAM_CHANGE_UPDATE_AFTER = 3;
-
-// Build the __BEFORE__ column name for a base column.
-inline std::string build_before_column_name(std::string_view name) {
-    std::string before_name = "__BEFORE__";
-    before_name.append(name.data(), name.size());
-    before_name.append("__");
-    return before_name;
-}
-
-// Resolve __BEFORE__ column index for a base column when present.
-inline int resolve_before_column_index(const doris::Block& block, int idx, int binlog_op_pos) {
-    if (idx == binlog_op_pos) {
-        return idx;
-    }
-
-    const auto& col_with_name = block.get_by_position(idx);
-    std::string before_name = build_before_column_name(col_with_name.name);
-    int tmp_idx = block.get_position_by_name(before_name);
-    return tmp_idx < 0 ? idx : tmp_idx;
-}
-
 enum class MinDeltaResultType { SKIP, INSERT, DELETE, UPDATE_BEFORE_AFTER };
 
 // MIN_DELTA uses row binlog op codes as indices into a 2D lookup table, so we guard the op layout here.
@@ -77,15 +53,17 @@ inline MinDeltaResultType calculate_min_delta_result(int64_t first_op, int64_t l
     //    Insert then delete within the same window yields no visible change.
     // 2) UPDATE -> DELETE = DELETE:
     //    Update then delete; downstream only needs the pre-delete snapshot.
-    // 3) DELETE -> APPEND = INSERT:
-    //    Delete then append (rebuild) is equivalent to inserting a new value.
+    // 3) DELETE -> APPEND/UPDATE = UPDATE_BEFORE_AFTER:
+    //    A DELETE as the first op means the key already existed before this window, so deleting
+    //    then re-adding it is an update of the pre-existing row (BEFORE = the deleted row's old
+    //    value), not a fresh insert.
     static constexpr std::array<std::array<ResultType, 3>, 3> kTransitionMatrix = {{
             // first_op = APPEND
             {ResultType::INSERT, ResultType::INSERT, ResultType::SKIP},
             // first_op = UPDATE
             {ResultType::UPDATE_BEFORE_AFTER, ResultType::UPDATE_BEFORE_AFTER, ResultType::DELETE},
             // first_op = DELETE
-            {ResultType::INSERT, ResultType::INSERT, ResultType::DELETE},
+            {ResultType::UPDATE_BEFORE_AFTER, ResultType::UPDATE_BEFORE_AFTER, ResultType::DELETE},
     }};
 
     // Fallback for unknown/invalid op codes: avoid out-of-bounds and keep changes conservatively.

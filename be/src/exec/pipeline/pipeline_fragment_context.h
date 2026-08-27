@@ -48,6 +48,7 @@ class ExecEnv;
 class RuntimeFilterMergeControllerEntity;
 class TDataSink;
 class TPipelineFragmentParams;
+class QueryCacheRuntime;
 
 class Dependency;
 struct LocalExchangeSharedState;
@@ -152,6 +153,8 @@ public:
 
 private:
     void _coordinator_callback(const ReportStatusRequest& req);
+    void _append_external_file_commit_data(const ReportStatusRequest& req,
+                                           TReportExecStatusParams* params) const;
     std::string _to_http_path(const std::string& file_name) const;
 
     void _release_resource();
@@ -229,6 +232,9 @@ private:
     std::atomic<int> _total_tasks = 0;
 
     std::unique_ptr<RuntimeProfile> _fragment_level_profile;
+    // This is used by loading process to report Fragment exec status to FE, FE need fragment status to
+    // check if the loading process is finished. And during the report, BE will send the loading message to FE,
+    // for example the loading error, commit rows num etc.
     bool _is_report_success = false;
 
     std::unique_ptr<RuntimeState> _runtime_state;
@@ -245,10 +251,6 @@ private:
 
     std::function<void(RuntimeState*, Status*)> _call_back;
     std::atomic_bool _is_fragment_instance_closed = false;
-
-    // If this is set to false, and '_is_report_success' is false as well,
-    // This executor will not report status to FE on being cancelled.
-    bool _is_report_on_cancel;
 
     // 0 indicates reporting is in progress or not required
     std::atomic_bool _disable_period_report = true;
@@ -379,6 +381,12 @@ private:
 
     TPipelineFragmentParams _params;
     int32_t _parallel_instances = 0;
+
+    // Query cache context of this fragment, shared by the olap scan operator
+    // and the cache source operator so both consume the same per-instance
+    // cache decision (HIT / INCREMENTAL / MISS). Created lazily when the
+    // fragment carries a query_cache_param. See QueryCacheRuntime.
+    std::shared_ptr<QueryCacheRuntime> _query_cache_runtime;
 
     std::atomic<bool> _need_notify_close = false;
     // Holds the brpc ClosureGuard for async wait-close during recursive CTE rerun.

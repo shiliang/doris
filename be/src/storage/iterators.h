@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <set>
 
 #include "common/status.h"
 #include "core/block/block.h"
@@ -36,14 +37,11 @@
 
 namespace doris {
 
-class Schema;
+class ReadSchema;
 class ColumnPredicate;
 
 struct IteratorRowRef;
 
-namespace segment_v2 {
-struct SubstreamIterator;
-}
 class StorageReadOptions {
 public:
     struct KeyRange {
@@ -106,6 +104,10 @@ public:
     std::unordered_map<int32_t, std::vector<std::shared_ptr<const ColumnPredicate>>>
             del_predicates_for_zone_map;
     TPushAggOp::type push_down_agg_type_opt = TPushAggOp::NONE;
+    // Non-key columns whose predicates were proven always true by the segment zone map and then
+    // removed from column_predicates. SegmentIterator can skip reading these non-output columns,
+    // or COUNT_ON_INDEX columns, because the column values no longer affect filtering or counting.
+    std::set<uint32_t> zonemap_always_true_pred_cols;
 
     // REQUIRED (null is not allowed)
     OlapReaderStatistics* stats = nullptr;
@@ -118,18 +120,23 @@ public:
     bool enable_unique_key_merge_on_write = false;
     bool record_rowids = false;
     std::vector<int> topn_filter_source_node_ids;
-    int topn_filter_target_node_id = -1;
     // used for special optimization for query : ORDER BY key DESC LIMIT n
     bool read_orderby_key_reverse = false;
     // For rows with the same key, use ascending order (small-to-large) for tie-breakers.
     // For example, use lower rowset version / segment id first.
     bool use_insert_order_when_same = false;
-    int binlog_lsn_idx = -1;
+    bool read_row_binlog = false;
+    int binlog_tso_idx = -1;
     // columns for orderby keys
     std::vector<uint32_t>* read_orderby_key_columns = nullptr;
     io::IOContext io_ctx;
     VExprContextSPtrs common_expr_ctxs_push_down;
     const std::set<int32_t>* output_columns = nullptr;
+    // Extra storage key columns that are included only to keep the scan schema
+    // aligned with the storage key prefix. SegmentIterator can synthesize
+    // placeholders only after proving predicates, delete conditions, and
+    // expressions do not need their real values.
+    std::set<ColumnId> extra_columns;
     // runtime state
     RuntimeState* runtime_state = nullptr;
     RowsetId rowset_id;
@@ -148,18 +155,12 @@ public:
 
     std::map<ColumnId, VExprContextSPtr> virtual_column_exprs;
     std::shared_ptr<segment_v2::AnnTopNRuntime> ann_topn_runtime;
-    std::map<ColumnId, size_t> vir_cid_to_idx_in_block;
-    std::map<size_t, DataTypePtr> vir_col_idx_to_type;
 
     std::map<int32_t, TColumnAccessPaths> all_access_paths;
     std::map<int32_t, TColumnAccessPaths> predicate_access_paths;
 
     std::shared_ptr<ScoreRuntime> score_runtime;
     CollectionStatisticsPtr collection_statistics;
-
-    // Cache for sparse column data to avoid redundant reads
-    // col_unique_id -> cached column_ptr
-    std::unordered_map<int32_t, ColumnPtr> sparse_column_cache;
 
     uint64_t condition_cache_digest = 0;
 };
@@ -236,7 +237,7 @@ public:
     }
 
     // return schema for this Iterator
-    virtual const Schema& schema() const = 0;
+    virtual const ReadSchema& schema() const = 0;
 
     // Return the data id such as segment id, used for keep the insert order when do
     // merge sort in priority queue

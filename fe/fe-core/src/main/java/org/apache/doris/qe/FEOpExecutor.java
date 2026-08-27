@@ -24,6 +24,7 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ErrorCode;
+import org.apache.doris.datasource.DelegatedCredential;
 import org.apache.doris.mysql.MysqlCommand;
 import org.apache.doris.thrift.FrontendService;
 import org.apache.doris.thrift.TExpr;
@@ -36,6 +37,7 @@ import org.apache.doris.thrift.TUniqueId;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -46,6 +48,7 @@ import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * FEOpExecutor is used to send request to specific FE
@@ -165,6 +168,7 @@ public class FEOpExecutor {
         // node ident
         params.setClientNodeHost(Env.getCurrentEnv().getSelfNode().getHost());
         params.setClientNodePort(Env.getCurrentEnv().getSelfNode().getPort());
+        params.setConnectingFeLocalResourceGroup(Config.local_resource_group);
         params.setSql(originStmt.originStmt);
         params.setStmtIdx(originStmt.idx);
         params.setUser(ctx.getQualifiedUser());
@@ -212,6 +216,13 @@ public class FEOpExecutor {
             }
         }
 
+        ctx.getSessionContext().getDelegatedCredential().ifPresent((DelegatedCredential credential) -> {
+            params.setDelegatedCredentialSessionId(ctx.getSessionContext().getSessionId());
+            params.setDelegatedCredentialType(credential.getType().name());
+            params.setDelegatedCredentialToken(credential.getToken());
+            credential.getExpiresAtMillis().ifPresent(params::setDelegatedCredentialExpiresAtMillis);
+        });
+
         // Propagate the client's CLIENT_DEPRECATE_EOF capability so the master FE
         // generates packets matching the original client's protocol expectations.
         params.setClientDeprecatedEOF(ctx.getMysqlChannel().clientDeprecatedEOF());
@@ -253,6 +264,13 @@ public class FEOpExecutor {
         } else {
             return null;
         }
+    }
+
+    public Set<Long> getAuditStatisticsBackendIds() {
+        if (result == null || !result.isSetAuditStatisticsBackendIds()) {
+            return Collections.emptySet();
+        }
+        return ImmutableSet.copyOf(result.getAuditStatisticsBackendIds());
     }
 
     public String getProxyStatus() {

@@ -22,6 +22,7 @@
 #include "exprs/vexpr.h"
 #include "exprs/vexpr_context.h"
 #include "format/transformer/vjni_format_transformer.h"
+#include "runtime/cluster_info.h"
 #include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
 #include "util/uid_util.h"
@@ -145,7 +146,7 @@ Status VMCTableWriter::write(RuntimeState* state, Block& block) {
 
     Block output_block;
     RETURN_IF_ERROR(VExprContext::get_output_block_after_execute_exprs(_vec_output_expr_ctxs, block,
-                                                                       &output_block));
+                                                                       &output_block, false));
     materialize_block_inplace(output_block);
 
     _row_count += output_block.rows();

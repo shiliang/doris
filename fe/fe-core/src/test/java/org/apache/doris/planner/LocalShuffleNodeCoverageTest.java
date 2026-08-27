@@ -17,16 +17,20 @@
 
 package org.apache.doris.planner;
 
+import org.apache.doris.analysis.AggregateInfo;
 import org.apache.doris.analysis.AssertNumRowsElement;
 import org.apache.doris.analysis.BinaryPredicate;
 import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.FunctionCallExpr;
 import org.apache.doris.analysis.GroupingInfo;
 import org.apache.doris.analysis.JoinOperator;
 import org.apache.doris.analysis.OrderByElement;
 import org.apache.doris.analysis.SlotDescriptor;
+import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.SortInfo;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.analysis.TupleId;
+import org.apache.doris.catalog.FunctionName;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.nereids.glue.translator.PlanTranslatorContext;
@@ -34,6 +38,8 @@ import org.apache.doris.nereids.trees.plans.PartitionTopnPhase;
 import org.apache.doris.nereids.trees.plans.WindowFuncType;
 import org.apache.doris.planner.LocalExchangeNode.LocalExchangeType;
 import org.apache.doris.planner.LocalExchangeNode.LocalExchangeTypeRequire;
+import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.thrift.TExplainLevel;
 import org.apache.doris.thrift.TPartitionType;
 import org.apache.doris.thrift.TPlanNode;
@@ -51,6 +57,33 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class LocalShuffleNodeCoverageTest {
     private static final AtomicInteger NEXT_ID = new AtomicInteger(1);
+
+    @Test
+    public void testRequireSpecificAutoRequireHashPreservesSpecificHash() {
+        // Pass-through operators (union / streaming agg / sort) forward their parent's specific
+        // hash requirement downward via autoRequireHash() while leaving row placement to their
+        // children. Every hash flavour must be forwarded unchanged: degrading a specific
+        // LOCAL_EXECUTION_HASH_SHUFFLE requirement to the generic RequireHash would let a
+        // bucket-distributed child satisfy it and keep its bucket placement while the operator
+        // still advertised LOCAL_EXECUTION_HASH_SHUFFLE upward, so a bucket join upgraded to
+        // local hash above it would skip its realign local exchange and compute wrong results.
+        for (LocalExchangeType hashType : new LocalExchangeType[] {
+                LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE,
+                LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE,
+                LocalExchangeType.BUCKET_HASH_SHUFFLE}) {
+            LocalExchangeNode.RequireSpecific require = new LocalExchangeNode.RequireSpecific(hashType);
+            LocalExchangeTypeRequire forwarded = require.autoRequireHash();
+            Assertions.assertSame(require, forwarded,
+                    "specific hash require " + hashType + " must be forwarded unchanged");
+            Assertions.assertEquals(hashType, forwarded.preferType());
+        }
+
+        // A non-hash specific require still relaxes to the generic RequireHash, whose preferType
+        // is GLOBAL_EXECUTION_HASH_SHUFFLE.
+        LocalExchangeTypeRequire relaxed =
+                new LocalExchangeNode.RequireSpecific(LocalExchangeType.PASSTHROUGH).autoRequireHash();
+        Assertions.assertEquals(LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE, relaxed.preferType());
+    }
 
     @Test
     public void testSelectNode() {
@@ -229,12 +262,12 @@ public class LocalShuffleNodeCoverageTest {
         hashJoin.setDistributionMode(DistributionMode.PARTITIONED);
         Pair<PlanNode, LocalExchangeType> hashOutput = hashJoin.enforceAndDeriveLocalExchange(
                 ctx, null, LocalExchangeTypeRequire.requireHash());
-        // PARTITIONED join requires GLOBAL hash to match cross-fragment exchange (DORIS-26101)
+        // PARTITIONED join requires GLOBAL hash to match cross-fragment exchange
         Assertions.assertEquals(LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE, hashOutput.second);
         assertChildLocalExchangeType(hashJoin, 0, LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE);
         assertChildLocalExchangeType(hashJoin, 1, LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE);
 
-        // DORIS-26101: PARTITIONED join with probe child already providing GLOBAL hash
+        // PARTITIONED join with probe child already providing GLOBAL hash
         // (e.g. upstream ExchangeNode) should satisfy requireGlobalExecutionHash without
         // inserting a new exchange.
         TrackingPlanNode probeGlobal = new TrackingPlanNode(nextPlanNodeId(),
@@ -251,7 +284,7 @@ public class LocalShuffleNodeCoverageTest {
                 "no exchange should be inserted when child already provides GLOBAL hash");
         Assertions.assertSame(buildGlobal, partitionedSatisfied.getChild(1));
 
-        // DORIS-26120: PARTITIONED join with serial source falls back to LOCAL hash
+        // PARTITIONED join with serial source falls back to LOCAL hash
         // because GLOBAL shuffle_idx_to_instance_idx is incomplete for serial exchange.
         TrackingScanNode probeSerial = new TrackingScanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
         TrackingPlanNode buildSerial = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
@@ -310,6 +343,157 @@ public class LocalShuffleNodeCoverageTest {
         Assertions.assertEquals(LocalExchangeType.NOOP, serialBuildOutput.second);
         Assertions.assertSame(nonSerialProbe, serialBuildBroadcast.getChild(0));
         assertChildLocalExchangeType(serialBuildBroadcast, 1, LocalExchangeType.PASS_TO_ONE);
+    }
+
+    private static List<List<Expr>> mockDistributeExprLists() {
+        return Lists.newArrayList(
+                Collections.singletonList(Mockito.mock(SlotRef.class)),
+                Collections.singletonList(Mockito.mock(SlotRef.class)));
+    }
+
+    @Test
+    public void testHashJoinBucketUpgradeToLocalHash() {
+        List<Expr> eqConjuncts = Collections.singletonList(Mockito.mock(BinaryPredicate.class));
+
+        // 1. Eligible fragment + parent doesn't need bucket → both sides re-distributed
+        //    with LOCAL_EXECUTION_HASH_SHUFFLE, output reports LOCAL hash.
+        PlanTranslatorContext upgradeCtx = new PlanTranslatorContext();
+        upgradeCtx.setCurrentFragmentBucketUpgradeEligible(true);
+        TrackingPlanNode probeBucket = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.BUCKET_HASH_SHUFFLE);
+        TrackingPlanNode buildNoop = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        HashJoinNode upgradedJoin = new HashJoinNode(nextPlanNodeId(), probeBucket, buildNoop,
+                JoinOperator.INNER_JOIN, eqConjuncts, Collections.emptyList(), null, null, false);
+        upgradedJoin.setChildrenDistributeExprLists(mockDistributeExprLists());
+        upgradedJoin.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        Pair<PlanNode, LocalExchangeType> upgradedOutput = upgradedJoin.enforceAndDeriveLocalExchange(
+                upgradeCtx, null, LocalExchangeTypeRequire.requireHash());
+        // BUCKET claim must NOT satisfy the upgrade's requireSpecific(LOCAL_EXECUTION_HASH):
+        // an LE is inserted on both sides.
+        Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, upgradedOutput.second);
+        assertChildLocalExchangeType(upgradedJoin, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+        assertChildLocalExchangeType(upgradedJoin, 1, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+
+        // 2. Child already providing LOCAL hash satisfies the upgraded require — no extra LE.
+        PlanTranslatorContext satisfiedCtx = new PlanTranslatorContext();
+        satisfiedCtx.setCurrentFragmentBucketUpgradeEligible(true);
+        TrackingPlanNode probeLocal = new TrackingPlanNode(nextPlanNodeId(),
+                LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+        TrackingPlanNode buildLocal = new TrackingPlanNode(nextPlanNodeId(),
+                LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+        HashJoinNode satisfiedJoin = new HashJoinNode(nextPlanNodeId(), probeLocal, buildLocal,
+                JoinOperator.INNER_JOIN, eqConjuncts, Collections.emptyList(), null, null, false);
+        satisfiedJoin.setChildrenDistributeExprLists(mockDistributeExprLists());
+        satisfiedJoin.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        Pair<PlanNode, LocalExchangeType> satisfiedUpgrade = satisfiedJoin.enforceAndDeriveLocalExchange(
+                satisfiedCtx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, satisfiedUpgrade.second);
+        Assertions.assertSame(probeLocal, satisfiedJoin.getChild(0));
+        Assertions.assertSame(buildLocal, satisfiedJoin.getChild(1));
+
+        // 3. Parent requires bucket distribution (upper bucket join) → no upgrade even when
+        //    the fragment is eligible: children keep BUCKET_HASH_SHUFFLE.
+        PlanTranslatorContext parentBucketCtx = new PlanTranslatorContext();
+        parentBucketCtx.setCurrentFragmentBucketUpgradeEligible(true);
+        TrackingPlanNode probeForBucketParent = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        TrackingPlanNode buildForBucketParent = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        HashJoinNode bucketParentJoin = new HashJoinNode(nextPlanNodeId(), probeForBucketParent,
+                buildForBucketParent, JoinOperator.INNER_JOIN, eqConjuncts, Collections.emptyList(),
+                null, null, false);
+        bucketParentJoin.setChildrenDistributeExprLists(mockDistributeExprLists());
+        bucketParentJoin.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        Pair<PlanNode, LocalExchangeType> bucketParentOutput = bucketParentJoin.enforceAndDeriveLocalExchange(
+                parentBucketCtx, null, LocalExchangeTypeRequire.requireBucketHash());
+        Assertions.assertEquals(LocalExchangeType.BUCKET_HASH_SHUFFLE, bucketParentOutput.second);
+        assertChildLocalExchangeType(bucketParentJoin, 0, LocalExchangeType.BUCKET_HASH_SHUFFLE);
+        assertChildLocalExchangeType(bucketParentJoin, 1, LocalExchangeType.BUCKET_HASH_SHUFFLE);
+
+        // 4. Fragment not eligible (ratio gate failed / not a pooled bucket fragment) →
+        //    existing behavior untouched.
+        PlanTranslatorContext ineligibleCtx = new PlanTranslatorContext();
+        TrackingPlanNode probeIneligible = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        TrackingPlanNode buildIneligible = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        HashJoinNode ineligibleJoin = new HashJoinNode(nextPlanNodeId(), probeIneligible, buildIneligible,
+                JoinOperator.INNER_JOIN, eqConjuncts, Collections.emptyList(), null, null, false);
+        ineligibleJoin.setChildrenDistributeExprLists(mockDistributeExprLists());
+        ineligibleJoin.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        Pair<PlanNode, LocalExchangeType> ineligibleOutput = ineligibleJoin.enforceAndDeriveLocalExchange(
+                ineligibleCtx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeType.BUCKET_HASH_SHUFFLE, ineligibleOutput.second);
+        assertChildLocalExchangeType(ineligibleJoin, 0, LocalExchangeType.BUCKET_HASH_SHUFFLE);
+        assertChildLocalExchangeType(ineligibleJoin, 1, LocalExchangeType.BUCKET_HASH_SHUFFLE);
+
+        // 5. Stacked bucket joins: the whole chain upgrades. The inner join (direct probe
+        //    child of the upgraded one) also upgrades its children to LOCAL hash, but
+        //    reports NOOP output so the outer join always inserts its own re-align LE
+        //    (keys may differ between levels).
+        PlanTranslatorContext stackedCtx = new PlanTranslatorContext();
+        stackedCtx.setCurrentFragmentBucketUpgradeEligible(true);
+        TrackingPlanNode innerProbe = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        TrackingPlanNode innerBuild = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        HashJoinNode innerJoin = new HashJoinNode(nextPlanNodeId(), innerProbe, innerBuild,
+                JoinOperator.INNER_JOIN, eqConjuncts, Collections.emptyList(), null, null, false);
+        innerJoin.setChildrenDistributeExprLists(mockDistributeExprLists());
+        innerJoin.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        TrackingPlanNode outerBuild = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        HashJoinNode outerJoin = new HashJoinNode(nextPlanNodeId(), innerJoin, outerBuild,
+                JoinOperator.INNER_JOIN, eqConjuncts, Collections.emptyList(), null, null, false);
+        outerJoin.setChildrenDistributeExprLists(mockDistributeExprLists());
+        outerJoin.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        Pair<PlanNode, LocalExchangeType> stackedOutput = outerJoin.enforceAndDeriveLocalExchange(
+                stackedCtx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, stackedOutput.second);
+        // outer upgraded: probe side wrapped with LOCAL hash LE (re-aligning inner's output)
+        assertChildLocalExchangeType(outerJoin, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+        assertChildLocalExchangeType(outerJoin, 1, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+        // inner upgraded too (whole-chain): its children get LOCAL hash LEs
+        assertChildLocalExchangeType(innerJoin, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+        assertChildLocalExchangeType(innerJoin, 1, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+
+        // 6. Colocate join takes the same upgrade path.
+        PlanTranslatorContext colocateCtx = new PlanTranslatorContext();
+        colocateCtx.setCurrentFragmentBucketUpgradeEligible(true);
+        TrackingPlanNode colocateProbe = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        TrackingPlanNode colocateBuild = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        HashJoinNode colocateJoin = new HashJoinNode(nextPlanNodeId(), colocateProbe, colocateBuild,
+                JoinOperator.INNER_JOIN, eqConjuncts, Collections.emptyList(), null, null, false);
+        colocateJoin.setChildrenDistributeExprLists(mockDistributeExprLists());
+        colocateJoin.setColocate(true, "test");
+        Pair<PlanNode, LocalExchangeType> colocateOutput = colocateJoin.enforceAndDeriveLocalExchange(
+                colocateCtx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, colocateOutput.second);
+        assertChildLocalExchangeType(colocateJoin, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+        assertChildLocalExchangeType(colocateJoin, 1, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+
+        // 7. Missing distribute exprs → no upgrade (the LOCAL hash LE would have no keys).
+        PlanTranslatorContext noExprCtx = new PlanTranslatorContext();
+        noExprCtx.setCurrentFragmentBucketUpgradeEligible(true);
+        TrackingPlanNode probeNoExpr = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        TrackingPlanNode buildNoExpr = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        HashJoinNode noExprJoin = new HashJoinNode(nextPlanNodeId(), probeNoExpr, buildNoExpr,
+                JoinOperator.INNER_JOIN, eqConjuncts, Collections.emptyList(), null, null, false);
+        noExprJoin.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        Pair<PlanNode, LocalExchangeType> noExprOutput = noExprJoin.enforceAndDeriveLocalExchange(
+                noExprCtx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeType.BUCKET_HASH_SHUFFLE, noExprOutput.second);
+        assertChildLocalExchangeType(noExprJoin, 0, LocalExchangeType.BUCKET_HASH_SHUFFLE);
+        assertChildLocalExchangeType(noExprJoin, 1, LocalExchangeType.BUCKET_HASH_SHUFFLE);
+    }
+
+
+    @Test
+    public void testShouldUpgradeBucketParallelismGate() {
+        // ratio <= 1 (including 0 and negatives) always disables — the knob doubles as the
+        // off switch: requiring at most 1x parallelism gain means no gain.
+        Assertions.assertFalse(AddLocalExchange.shouldUpgradeBucketParallelism(0, 16, 8));
+        Assertions.assertFalse(AddLocalExchange.shouldUpgradeBucketParallelism(-1, 16, 8));
+        Assertions.assertFalse(AddLocalExchange.shouldUpgradeBucketParallelism(1.0, 16, 8));
+        // active threshold: instances must exceed buckets-with-data × ratio
+        Assertions.assertTrue(AddLocalExchange.shouldUpgradeBucketParallelism(1.5, 16, 8));
+        Assertions.assertFalse(AddLocalExchange.shouldUpgradeBucketParallelism(1.5, 12, 8));
+        Assertions.assertFalse(AddLocalExchange.shouldUpgradeBucketParallelism(2.0, 16, 8));
+        Assertions.assertTrue(AddLocalExchange.shouldUpgradeBucketParallelism(1.5, 256, 8));
+        // no buckets with data → nothing to upgrade
+        Assertions.assertFalse(AddLocalExchange.shouldUpgradeBucketParallelism(1.5, 16, 0));
     }
 
     @Test
@@ -430,8 +614,59 @@ public class LocalShuffleNodeCoverageTest {
         ctx.setHasShuffleForCorrectnessAncestor(unionNode, true);
         Pair<PlanNode, LocalExchangeType> unionOutput = unionNode.enforceAndDeriveLocalExchange(
                 ctx, null, LocalExchangeTypeRequire.requireHash());
+        // The single branch really is re-partitioned by LOCAL_EXECUTION_HASH_SHUFFLE (it claimed
+        // NOOP, so enforceRequire inserted the exchange), so advertising that type is truthful.
         Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, unionOutput.second);
         Assertions.assertEquals(LocalExchangeNode.RequireHash.class, unionChild.lastRequire.getClass());
+
+        // A branch that already is on a hash placement is reported as-is instead of being
+        // relabelled: the union claimed LOCAL_EXECUTION_HASH_SHUFFLE unconditionally before, which
+        // was a claim about data that never moved.
+        UnionNode passthroughUnion = new UnionNode(nextPlanNodeId(), new TupleId(NEXT_ID.getAndIncrement()));
+        TrackingPlanNode globalHashChild = new TrackingPlanNode(nextPlanNodeId(),
+                LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE);
+        passthroughUnion.addChild(globalHashChild);
+        ctx.setHasShuffleForCorrectnessAncestor(passthroughUnion, true);
+        Pair<PlanNode, LocalExchangeType> passthroughOutput = passthroughUnion
+                .enforceAndDeriveLocalExchange(ctx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE, passthroughOutput.second);
+        Assertions.assertSame(globalHashChild, passthroughUnion.getChild(0));
+
+        // Bucket-shuffle UnionNode under a shuffle-for-correctness consumer: the branches are
+        // aligned by the basic child's storage bucket function, so the union must require
+        // BUCKET_HASH_SHUFFLE from every branch instead of the generic hash. With the generic
+        // require the branch arriving through a bucket-shuffle exchange satisfies it and keeps
+        // its bucket placement while a serial (NOOP-claim) branch is re-partitioned by execution
+        // hash, splitting one key across two pipeline tasks (duplicate row_number()=1).
+        UnionNode bucketUnion = new UnionNode(nextPlanNodeId(), new TupleId(NEXT_ID.getAndIncrement()));
+        bucketUnion.setColocate(false);
+        bucketUnion.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        TrackingPlanNode bucketUnionLeft = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        TrackingPlanNode bucketUnionRight = new TrackingPlanNode(nextPlanNodeId(),
+                LocalExchangeType.BUCKET_HASH_SHUFFLE);
+        bucketUnion.addChild(bucketUnionLeft);
+        bucketUnion.addChild(bucketUnionRight);
+        ctx.setHasShuffleForCorrectnessAncestor(bucketUnion, true);
+        Pair<PlanNode, LocalExchangeType> bucketUnionOutput = bucketUnion.enforceAndDeriveLocalExchange(
+                ctx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeType.BUCKET_HASH_SHUFFLE, bucketUnionOutput.second);
+        // the serial branch is re-aligned by bucket hash ...
+        assertChildLocalExchangeType(bucketUnion, 0, LocalExchangeType.BUCKET_HASH_SHUFFLE);
+        // ... and the branch that already is bucket-distributed keeps its placement untouched
+        Assertions.assertSame(bucketUnionRight, bucketUnion.getChild(1));
+
+        // Without a downstream shuffle-for-correctness consumer a bucket-shuffle union still
+        // requires nothing: UNION ALL only concatenates, so no branch has to move.
+        UnionNode bucketUnionNoConsumer = new UnionNode(nextPlanNodeId(),
+                new TupleId(NEXT_ID.getAndIncrement()));
+        bucketUnionNoConsumer.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        TrackingPlanNode noConsumerChild = new TrackingPlanNode(nextPlanNodeId(),
+                LocalExchangeType.BUCKET_HASH_SHUFFLE);
+        bucketUnionNoConsumer.addChild(noConsumerChild);
+        Pair<PlanNode, LocalExchangeType> noConsumerOutput = bucketUnionNoConsumer.enforceAndDeriveLocalExchange(
+                ctx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeType.NOOP, noConsumerOutput.second);
+        Assertions.assertSame(noConsumerChild, bucketUnionNoConsumer.getChild(0));
 
         IntersectNode intersectNode = new IntersectNode(nextPlanNodeId(), new TupleId(NEXT_ID.getAndIncrement()));
         intersectNode.setColocate(false);
@@ -441,7 +676,7 @@ public class LocalShuffleNodeCoverageTest {
         intersectNode.addChild(right);
         Pair<PlanNode, LocalExchangeType> intersectOutput = intersectNode.enforceAndDeriveLocalExchange(
                 ctx, null, LocalExchangeTypeRequire.requireHash());
-        // PARTITIONED intersect requires GLOBAL hash (DORIS-26100)
+        // PARTITIONED intersect requires GLOBAL hash
         Assertions.assertEquals(LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE, intersectOutput.second);
         assertChildLocalExchangeType(intersectNode, 0, LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE);
         assertChildLocalExchangeType(intersectNode, 1, LocalExchangeType.GLOBAL_EXECUTION_HASH_SHUFFLE);
@@ -460,6 +695,28 @@ public class LocalShuffleNodeCoverageTest {
         // OlapScan already satisfies requireBucketHash(), so children are passed through unchanged.
         Assertions.assertSame(exceptLeft, exceptNode.getChild(0));
         Assertions.assertSame(exceptRight, exceptNode.getChild(1));
+
+        // Bucket-shuffle IntersectNode (not colocated): exercises the `|| isBucketShuffle()` leg.
+        // Every child is distributed by the basic child's storage bucket function (via bucket-shuffle
+        // exchanges), so the output is BUCKET_HASH_SHUFFLE and each serial (NOOP) child is re-aligned
+        // with a BUCKET_HASH_SHUFFLE local exchange. Without the isBucketShuffle() branch this would
+        // fall into the partitioned (GLOBAL hash) leg and re-partition one side by a different hash
+        // function, breaking alignment. setColocate(false) keeps isColocated() false (SetOperationNode
+        // returns false immediately when isColocate() is false), so the branch is reached through
+        // isBucketShuffle() alone.
+        IntersectNode bucketIntersect = new IntersectNode(nextPlanNodeId(),
+                new TupleId(NEXT_ID.getAndIncrement()));
+        bucketIntersect.setColocate(false);
+        bucketIntersect.setDistributionMode(DistributionMode.BUCKET_SHUFFLE);
+        TrackingPlanNode bucketLeft = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        TrackingPlanNode bucketRight = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
+        bucketIntersect.addChild(bucketLeft);
+        bucketIntersect.addChild(bucketRight);
+        Pair<PlanNode, LocalExchangeType> bucketIntersectOutput = bucketIntersect.enforceAndDeriveLocalExchange(
+                ctx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeType.BUCKET_HASH_SHUFFLE, bucketIntersectOutput.second);
+        assertChildLocalExchangeType(bucketIntersect, 0, LocalExchangeType.BUCKET_HASH_SHUFFLE);
+        assertChildLocalExchangeType(bucketIntersect, 1, LocalExchangeType.BUCKET_HASH_SHUFFLE);
 
         TrackingPlanNode assertChild = new TrackingPlanNode(nextPlanNodeId(), LocalExchangeType.NOOP);
         AssertNumRowsElement assertElement = Mockito.mock(AssertNumRowsElement.class);
@@ -601,6 +858,296 @@ public class LocalShuffleNodeCoverageTest {
         Pair<PlanNode, LocalExchangeType> noopOutput = noopExchange.enforceAndDeriveLocalExchange(
                 ctx, null, LocalExchangeTypeRequire.requireHash());
         Assertions.assertEquals(LocalExchangeType.NOOP, noopOutput.second);
+    }
+
+    @Test
+    public void testAggregationNodeDistinctFinalizeRequiresHash() {
+        // count(distinct k) without group-by: the finalize merge agg emits per-instance
+        // scalar values that the parent sums (sum0(multi_distinct_count(...)) above), so
+        // the input must be hash-partitioned by the distinct key. Pre-fix this agg got
+        // NoRequire and a PASSTHROUGH local exchange below scattered same-key rows across
+        // instances → the parent double-counted (result = correct × task count).
+        for (String fn : new String[] {"multi_distinct_count", "multi_distinct_sum",
+                "multi_distinct_group_concat"}) {
+            AggContext agg = buildAggContext(Collections.singletonList(multiDistinctFunction(fn)), /* groupByExprs */ true,
+                    /* merge */ true, /* needsFinalize */ true, LocalExchangeType.NOOP, KEYED_DISTRIBUTE_EXPRS);
+            Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                    agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+            Assertions.assertEquals(LocalExchangeNode.RequireHash.class, agg.child.lastRequire.getClass(),
+                    fn + " finalize agg must require hash input");
+            Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, output.second);
+            assertChildLocalExchangeType(agg.node, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+        }
+    }
+
+    @Test
+    public void testAggregationNodeDistinctFinalizeWithParentHashRequirement() {
+        // A parent that already requires hash must not change the agg's own hash demand.
+        AggContext agg = buildAggContext(Collections.singletonList(multiDistinctFunction("multi_distinct_count")), /* groupByExprs */ true,
+                /* merge */ true, /* needsFinalize */ true, LocalExchangeType.NOOP, KEYED_DISTRIBUTE_EXPRS);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.requireHash());
+        Assertions.assertEquals(LocalExchangeNode.RequireHash.class, agg.child.lastRequire.getClass());
+        Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, output.second);
+        assertChildLocalExchangeType(agg.node, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+    }
+
+    @Test
+    public void testAggregationNodeDirectMultiDistinctNoKeyStaysNoRequire() {
+        // A directly called scalar multi_distinct_count(col) has isDistinct=false and
+        // no child distribute exprs (SplitAggWithoutDistinct builds a LOCAL aggregate
+        // without partition exprs). It must NOT be given a HASH requirement — a
+        // zero-key HASH exchange would collapse the whole input onto one task per BE.
+        AggContext agg = buildAggContext(Collections.singletonList(multiDistinctFunction("multi_distinct_count")),
+                /* groupByExprs */ true, /* merge */ true, /* needsFinalize */ true,
+                LocalExchangeType.NOOP, null);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+        Assertions.assertEquals(LocalExchangeNode.NoRequire.class, agg.child.lastRequire.getClass(),
+                "direct multi_distinct with no effective key must stay NoRequire");
+        Assertions.assertEquals(LocalExchangeType.NOOP, output.second);
+        Assertions.assertSame(agg.child, agg.node.getChild(0));
+    }
+
+    @Test
+    public void testAggregationNodeNoPartitionNonFinalizeBaseClassRequire() {
+        // COUNT(*)-style non-finalize (LOCAL) agg: no partition requirement, so
+        // the non-finalize arm of the first branch falls back to base class
+        // behavior (NOOP for a non-serial child). The agg exprs are non-empty
+        // (a plain count function) so the AggSink branch is exercised rather
+        // than DistinctStreamingAgg.
+        AggContext agg = buildAggContext(
+                Collections.singletonList(plainAggregateFunction("count")), /* groupByExprs */ true,
+                /* merge */ false, /* needsFinalize */ false, LocalExchangeType.NOOP, null);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+        Assertions.assertEquals(LocalExchangeNode.NoRequire.class, agg.child.lastRequire.getClass());
+        Assertions.assertEquals(LocalExchangeType.NOOP, output.second);
+        Assertions.assertSame(agg.child, agg.node.getChild(0));
+    }
+
+    @Test
+    public void testAggregationNodeNoPartitionFinalizeStaysNoRequire() {
+        // COUNT(*)-style agg (no group keys, no DISTINCT aggregates) genuinely has no
+        // partition requirement: the input distribution is irrelevant.
+        AggContext agg = buildAggContext(Collections.singletonList(plainAggregateFunction("count")), /* groupByExprs */ true,
+                /* merge */ true, /* needsFinalize */ true, LocalExchangeType.NOOP, null);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+        Assertions.assertEquals(LocalExchangeNode.NoRequire.class, agg.child.lastRequire.getClass());
+        Assertions.assertEquals(LocalExchangeType.NOOP, output.second);
+        Assertions.assertSame(agg.child, agg.node.getChild(0));
+    }
+
+    @Test
+    public void testAggregationNodeDistinctLocalPhaseDefaultLeRequiresHash() {
+        // LOCAL (FIRST/SECOND, non-merge, non-finalize) phase of a distinct agg with the
+        // default enable_local_exchange_before_agg=true: BE requires HASH here
+        // (partition_exprs non-empty), so the FE must mirror that.
+        AggContext agg = buildAggContext(Collections.singletonList(multiDistinctFunction("multi_distinct_count")), /* groupByExprs */ true,
+                /* merge */ false, /* needsFinalize */ false, LocalExchangeType.NOOP, KEYED_DISTRIBUTE_EXPRS);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+        Assertions.assertEquals(LocalExchangeNode.RequireHash.class, agg.child.lastRequire.getClass(),
+                "LOCAL distinct phase with default LE requires hash");
+        Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, output.second);
+        assertChildLocalExchangeType(agg.node, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+    }
+
+    @Test
+    public void testAggregationNodeDistinctLocalPhaseWithLeDisabledStaysNoRequire() {
+        // LOCAL distinct phase + enable_local_exchange_before_agg=false → base class
+        // behavior (NOOP for a non-serial child): user explicitly opted out of pre-agg LE.
+        AggContext agg = buildAggContext(Collections.singletonList(multiDistinctFunction("multi_distinct_count")), /* groupByExprs */ true,
+                /* merge */ false, /* needsFinalize */ false, LocalExchangeType.NOOP, KEYED_DISTRIBUTE_EXPRS);
+        SessionVariable sessionVariable = new SessionVariable();
+        sessionVariable.enableLocalExchangeBeforeAgg = false;
+        Mockito.when(agg.connectContext.getSessionVariable()).thenReturn(sessionVariable);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+        Assertions.assertEquals(LocalExchangeNode.NoRequire.class, agg.child.lastRequire.getClass(),
+                "LOCAL distinct phase with LE disabled keeps no alignment requirement");
+        Assertions.assertEquals(LocalExchangeType.NOOP, output.second);
+        Assertions.assertSame(agg.child, agg.node.getChild(0));
+    }
+
+    @Test
+    public void testAggregationNodeDistinctFirstMergeRequiresHash() {
+        // FIRST_MERGE (correctness-required) keeps the hash demand even when the
+        // user opts out of pre-agg local exchanges (enable_local_exchange_before_agg
+        // = false): removing the !isMerge() exemption must not weaken it.
+        AggContext agg = buildAggContext(Collections.singletonList(multiDistinctFunction("multi_distinct_count")), /* groupByExprs */ true,
+                /* merge */ true, /* needsFinalize */ false, LocalExchangeType.NOOP, KEYED_DISTRIBUTE_EXPRS);
+        SessionVariable sessionVariable = new SessionVariable();
+        sessionVariable.enableLocalExchangeBeforeAgg = false;
+        Mockito.when(agg.connectContext.getSessionVariable()).thenReturn(sessionVariable);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+        Assertions.assertEquals(LocalExchangeNode.RequireHash.class, agg.child.lastRequire.getClass(),
+                "FIRST_MERGE must keep the hash demand with enable_local_exchange_before_agg=false");
+        Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, output.second);
+        assertChildLocalExchangeType(agg.node, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+    }
+
+    @Test
+    public void testAggregationNodeGroupByFinalizeRequiresHash() {
+        // GROUP BY finalize agg requires hash input; when the parent has no hash
+        // requirement the semantic partition exprs (group keys) drive the decision.
+        AggContext agg = buildAggContext(Collections.singletonList(plainAggregateFunction("count")), /* groupByExprs */ false,
+                /* merge */ true, /* needsFinalize */ true, LocalExchangeType.NOOP, null);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+        Assertions.assertEquals(LocalExchangeNode.RequireHash.class, agg.child.lastRequire.getClass());
+        Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, output.second);
+        assertChildLocalExchangeType(agg.node, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+    }
+
+    @Test
+    public void testAggregationNodeGroupByLocalPhaseWithLeDisabledStaysNoRequire() {
+        // GROUP BY local phase + enable_local_exchange_before_agg=false → base class
+        // behavior (NOOP for a non-serial child): user explicitly opted out of pre-agg LE.
+        // aggExprs is non-empty so the AggSink branch is exercised (an empty aggExprs
+        // would route through DistinctStreamingAgg with its own hash logic).
+        AggContext agg = buildAggContext(Collections.singletonList(multiDistinctFunction("multi_distinct_count")), /* groupByExprs */ false,
+                /* merge */ false, /* needsFinalize */ false, LocalExchangeType.NOOP, KEYED_DISTRIBUTE_EXPRS);
+        SessionVariable sessionVariable = new SessionVariable();
+        sessionVariable.enableLocalExchangeBeforeAgg = false;
+        Mockito.when(agg.connectContext.getSessionVariable()).thenReturn(sessionVariable);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+        Assertions.assertEquals(LocalExchangeNode.NoRequire.class, agg.child.lastRequire.getClass());
+        Assertions.assertEquals(LocalExchangeType.NOOP, output.second);
+        Assertions.assertSame(agg.child, agg.node.getChild(0));
+    }
+
+    @Test
+    public void testAggregationNodeRequiresShuffleForCorrectness() {
+        // Mirrors BE is_shuffled_operator(): finalize agg with partition exprs
+        // (group keys or DISTINCT aggregates) needs hash-distributed input.
+        AggContext distinctAgg = buildAggContext(Collections.singletonList(multiDistinctFunction("multi_distinct_count")),
+                /* groupByExprs */ true, /* merge */ true, /* needsFinalize */ true,
+                LocalExchangeType.NOOP, KEYED_DISTRIBUTE_EXPRS);
+        Assertions.assertTrue(distinctAgg.node.requiresShuffleForCorrectness(),
+                "distinct finalize agg must require shuffle for correctness");
+
+        AggContext noPartitionAgg = buildAggContext(Collections.singletonList(plainAggregateFunction("count")), /* groupByExprs */ true,
+                /* merge */ true, /* needsFinalize */ true, LocalExchangeType.NOOP, null);
+        Assertions.assertFalse(noPartitionAgg.node.requiresShuffleForCorrectness(),
+                "COUNT(*) finalize agg has no partition requirement");
+
+        AggContext groupByAgg = buildAggContext(Collections.singletonList(plainAggregateFunction("count")), /* groupByExprs */ false,
+                /* merge */ true, /* needsFinalize */ true, LocalExchangeType.NOOP, null);
+        Assertions.assertTrue(groupByAgg.node.requiresShuffleForCorrectness(),
+                "GROUP BY finalize agg must require shuffle for correctness");
+
+        AggContext localAgg = buildAggContext(Collections.singletonList(multiDistinctFunction("multi_distinct_count")),
+                /* groupByExprs */ true, /* merge */ false, /* needsFinalize */ false,
+                LocalExchangeType.NOOP, KEYED_DISTRIBUTE_EXPRS);
+        Assertions.assertFalse(localAgg.node.requiresShuffleForCorrectness(),
+                "non-finalize agg does not require shuffle for correctness");
+    }
+
+    @Test
+    public void testAggregationNodeInheritedShuffleUsesChildDistributeExprs() {
+        // An intermediate agg that inherits a shuffle-for-correctness ancestor (e.g.
+        // DISTINCT_GLOBAL/FIRST_MERGE chain above a Union) keeps the child distribute
+        // exprs as its hash key even though the agg itself has no DISTINCT functions.
+        // The grouping key is deliberately different from the child distribution key:
+        // dropping the inherited state or selecting the grouping key must fail this test.
+        Expr groupingExpr = Mockito.mock(Expr.class, "groupingExpr");
+        Expr childDistributeExpr = Mockito.mock(Expr.class, "childDistributeExpr");
+        List<Expr> childDistributeExprs = Collections.singletonList(childDistributeExpr);
+        AggContext agg = buildAggContext(
+                Collections.singletonList(plainAggregateFunction("count")),
+                Collections.singletonList(groupingExpr), /* merge */ true,
+                /* needsFinalize */ false, LocalExchangeType.NOOP, childDistributeExprs);
+        Mockito.when(agg.ctx.hasShuffleForCorrectnessAncestor(agg.node)).thenReturn(true);
+        Pair<PlanNode, LocalExchangeType> output = agg.node.enforceAndDeriveLocalExchange(
+                agg.ctx, null, LocalExchangeTypeRequire.noRequire());
+        Assertions.assertEquals(LocalExchangeNode.RequireHash.class, agg.child.lastRequire.getClass(),
+                "inherited shuffle ancestor must keep the hash demand");
+        Assertions.assertEquals(LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE, output.second);
+        assertChildLocalExchangeType(agg.node, 0, LocalExchangeType.LOCAL_EXECUTION_HASH_SHUFFLE);
+        LocalExchangeNode exchangeNode = (LocalExchangeNode) agg.node.getChild(0);
+        Assertions.assertEquals(childDistributeExprs, exchangeNode.getDistributeExprLists(),
+                "inherited intermediate agg must hash by the child's distribution key");
+        Assertions.assertNotEquals(Collections.singletonList(groupingExpr), exchangeNode.getDistributeExprLists(),
+                "the grouping key must not replace the inherited child distribution key");
+    }
+
+    /** A non-empty child distribute expr list, as fragment planning sets for a keyed DISTINCT agg. */
+    private static final List<Expr> KEYED_DISTRIBUTE_EXPRS =
+            Collections.singletonList(Mockito.mock(Expr.class));
+
+    private static class AggContext {
+        final AggregationNode node;
+        final PlanTranslatorContext ctx;
+        final TrackingPlanNode child;
+        final ConnectContext connectContext;
+
+        AggContext(AggregationNode node, PlanTranslatorContext ctx, TrackingPlanNode child,
+                ConnectContext connectContext) {
+            this.node = node;
+            this.ctx = ctx;
+            this.child = child;
+            this.connectContext = connectContext;
+        }
+    }
+
+    /**
+     * noGroupByExprs == true → no group keys (mirrors the scalar COUNT(DISTINCT));
+     * distributeExprs != null → the plan set child distribute exprs for this agg
+     * (as fragment planning does for a DISTINCT agg), which is what makes
+     * hasPartitionRequirement() true for a keyed agg.
+     */
+    private static AggContext buildAggContext(List<FunctionCallExpr> aggExprs, boolean noGroupByExprs,
+            boolean merge, boolean needsFinalize, LocalExchangeType childProvided,
+            List<Expr> distributeExprs) {
+        List<Expr> groupingExprs = noGroupByExprs
+                ? Collections.emptyList() : Collections.singletonList(Mockito.mock(Expr.class));
+        return buildAggContext(aggExprs, groupingExprs, merge, needsFinalize,
+                childProvided, distributeExprs);
+    }
+
+    private static AggContext buildAggContext(List<FunctionCallExpr> aggExprs, List<Expr> groupingExprs,
+            boolean merge, boolean needsFinalize, LocalExchangeType childProvided,
+            List<Expr> distributeExprs) {
+        PlanTranslatorContext ctx = Mockito.mock(PlanTranslatorContext.class);
+        ConnectContext connectContext = Mockito.mock(ConnectContext.class);
+        Mockito.when(connectContext.getSessionVariable()).thenReturn(new SessionVariable());
+        Mockito.when(ctx.getConnectContext()).thenReturn(connectContext);
+
+        AggregateInfo aggInfo = Mockito.mock(AggregateInfo.class);
+        Mockito.when(aggInfo.getOutputTupleId()).thenReturn(new TupleId(NEXT_ID.getAndIncrement()));
+        Mockito.when(aggInfo.getGroupingExprs()).thenReturn(new ArrayList<>(groupingExprs));
+        Mockito.when(aggInfo.getAggregateExprs()).thenReturn(new ArrayList<>(aggExprs));
+        Mockito.when(aggInfo.isMerge()).thenReturn(merge);
+
+        TrackingPlanNode child = new TrackingPlanNode(nextPlanNodeId(), childProvided);
+        AggregationNode agg = new AggregationNode(nextPlanNodeId(), child, aggInfo);
+        if (distributeExprs != null) {
+            agg.setChildrenDistributeExprLists(Collections.singletonList(distributeExprs));
+        }
+        if (!needsFinalize) {
+            agg.unsetNeedsFinalize();
+        }
+        return new AggContext(agg, ctx, child, connectContext);
+    }
+
+    private static FunctionCallExpr plainAggregateFunction(String functionName) {
+        FunctionCallExpr fce = Mockito.mock(FunctionCallExpr.class);
+        FunctionName fnName = Mockito.mock(FunctionName.class);
+        Mockito.when(fnName.getFunction()).thenReturn(functionName);
+        Mockito.when(fce.getFnName()).thenReturn(fnName);
+        return fce;
+    }
+
+    private static FunctionCallExpr multiDistinctFunction(String functionName) {
+        FunctionCallExpr fce = Mockito.mock(FunctionCallExpr.class);
+        FunctionName fnName = Mockito.mock(FunctionName.class);
+        Mockito.when(fnName.getFunction()).thenReturn(functionName);
+        Mockito.when(fce.getFnName()).thenReturn(fnName);
+        return fce;
     }
 
     private static PlanNodeId nextPlanNodeId() {

@@ -26,8 +26,10 @@ import org.apache.doris.cdcclient.utils.ConfigUtil;
 import org.apache.doris.cdcclient.utils.SmallFileMgr;
 import org.apache.doris.job.cdc.DataSourceConfigKeys;
 import org.apache.doris.job.cdc.request.CompareOffsetRequest;
+import org.apache.doris.job.cdc.request.FetchEndOffsetRequest;
 import org.apache.doris.job.cdc.request.JobBaseConfig;
 import org.apache.doris.job.cdc.request.JobBaseRecordRequest;
+import org.apache.doris.job.cdc.response.FetchEndOffsetResult;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
@@ -55,13 +57,13 @@ import org.apache.flink.cdc.connectors.postgres.source.utils.PostgresTypeUtils;
 import org.apache.flink.cdc.connectors.postgres.source.utils.TableDiscoveryUtils;
 import org.apache.flink.table.types.DataType;
 
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -78,6 +80,7 @@ import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.PostgresReplicationConnection;
 import io.debezium.connector.postgresql.spi.SlotState;
+import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.Column;
 import io.debezium.relational.TableId;
@@ -99,17 +102,6 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
     public PostgresSourceReader() {
         super();
         this.setSerializer(new PostgresDebeziumJsonDeserializer());
-    }
-
-    @Override
-    public void initialize(String jobId, DataSource dataSource, Map<String, String> config) {
-        super.initialize(jobId, dataSource, config);
-        // Inject PG schema refresher so the deserializer can fetch accurate column types on DDL
-        if (serializer instanceof PostgresDebeziumJsonDeserializer) {
-            ((PostgresDebeziumJsonDeserializer) serializer)
-                    .setPgSchemaRefresher(
-                            tableId -> refreshSingleTableSchema(tableId, config, jobId));
-        }
     }
 
     // First open only, NOT initialize: a rebuilt reader must not recreate a dropped slot.
@@ -270,7 +262,10 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
         String schema = cdcConfig.get(DataSourceConfigKeys.SCHEMA);
         Preconditions.checkNotNull(schema, "schema is required");
         configFactory.schemaList(new String[] {schema});
-        configFactory.includeSchemaChanges(false);
+        boolean schemaChangeEnabled =
+                Boolean.parseBoolean(
+                        cdcConfig.getOrDefault(DataSourceConfigKeys.SCHEMA_CHANGE_ENABLED, "true"));
+        configFactory.includeSchemaChanges(schemaChangeEnabled);
 
         // Set table list
         String[] tableList = ConfigUtil.getTableList(schema, cdcConfig);
@@ -302,11 +297,11 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
             throw new RuntimeException("Unknown offset " + startupMode);
         }
 
-        // Set split size if provided
-        if (cdcConfig.containsKey(DataSourceConfigKeys.SNAPSHOT_SPLIT_SIZE)) {
-            configFactory.splitSize(
-                    Integer.parseInt(cdcConfig.get(DataSourceConfigKeys.SNAPSHOT_SPLIT_SIZE)));
-        }
+        configFactory.splitSize(
+                Integer.parseInt(
+                        cdcConfig.getOrDefault(
+                                DataSourceConfigKeys.SNAPSHOT_SPLIT_SIZE,
+                                DataSourceConfigKeys.SNAPSHOT_SPLIT_SIZE_DEFAULT)));
 
         if (cdcConfig.containsKey(DataSourceConfigKeys.SNAPSHOT_SPLIT_KEY)) {
             configFactory.chunkKeyColumn(cdcConfig.get(DataSourceConfigKeys.SNAPSHOT_SPLIT_KEY));
@@ -474,28 +469,74 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
         }
     }
 
-    /**
-     * Why not call dialect.displayCurrentOffset(sourceConfig) ? The underlying system calls
-     * `txid_current()` to advance the WAL log. Here, it's just a query; retrieving the LSN is
-     * sufficient because `PostgresOffset.compare` only compares the LSN.
-     */
     @Override
-    public Map<String, String> getEndOffset(JobBaseConfig jobConfig) {
-        PostgresSourceConfig sourceConfig = getSourceConfig(jobConfig);
-        try {
-            PostgresDialect dialect = new PostgresDialect(sourceConfig);
-            try (JdbcConnection jdbcConnection = dialect.openJdbcConnection(sourceConfig)) {
-                PostgresConnection pgConnection = (PostgresConnection) jdbcConnection;
-                Long lsn = pgConnection.currentXLogLocation();
-                Map<String, String> offsetMap = new HashMap<>();
-                offsetMap.put(SourceInfo.LSN_KEY, lsn.toString());
-                offsetMap.put(
-                        SourceInfo.TIMESTAMP_USEC_KEY,
-                        String.valueOf(Conversions.toEpochMicros(Instant.MIN)));
-                return offsetMap;
+    public FetchEndOffsetResult fetchEndOffset(FetchEndOffsetRequest request) {
+        PostgresSourceConfig sourceConfig = getSourceConfig(request);
+        PostgresDialect dialect = new PostgresDialect(sourceConfig);
+        String slotName = dialect.getSlotName();
+        try (JdbcConnection jdbcConnection = dialect.openJdbcConnection(sourceConfig)) {
+            PostgresConnection pgConnection = (PostgresConnection) jdbcConnection;
+            // displayCurrentOffset() calls txid_current() and advances WAL; reading the current LSN
+            // is sufficient because PostgresOffset.compare() only compares LSN.
+            Long lsn = pgConnection.currentXLogLocation();
+            Map<String, String> endOffset = new HashMap<>();
+            endOffset.put(SourceInfo.LSN_KEY, lsn.toString());
+            endOffset.put(
+                    SourceInfo.TIMESTAMP_USEC_KEY,
+                    String.valueOf(Conversions.toEpochMicros(Instant.MIN)));
+            long lagBytes;
+            try {
+                lagBytes = calculateLagBytes(request, lsn, slotName, jdbcConnection);
+            } catch (Exception exception) {
+                lagBytes = -1;
+                LOG.warn(
+                        "Failed to calculate source log lag for job {}",
+                        request.getJobId(),
+                        exception);
             }
-        } catch (Exception ex) {
-            throw new RuntimeException(ex);
+            return new FetchEndOffsetResult(endOffset, lagBytes);
+        } catch (Exception exception) {
+            throw new RuntimeException(exception);
+        }
+    }
+
+    private long calculateLagBytes(
+            FetchEndOffsetRequest request,
+            long endOffset,
+            String slotName,
+            JdbcConnection jdbcConnection)
+            throws SQLException {
+        try (PreparedStatement statement =
+                jdbcConnection
+                        .connection()
+                        .prepareStatement(
+                                "SELECT pg_wal_lsn_diff("
+                                        + "?::pg_lsn,"
+                                        + " GREATEST(confirmed_flush_lsn,"
+                                        + " COALESCE(?::pg_lsn, confirmed_flush_lsn)))::bigint"
+                                        + " FROM pg_replication_slots"
+                                        + " WHERE slot_name = ?")) {
+            String currentOffset = null;
+            Map<String, String> referenceOffset = request.getReferenceOffset();
+            if (referenceOffset != null && referenceOffset.get(SourceInfo.LSN_KEY) != null) {
+                currentOffset =
+                        Lsn.valueOf(Long.parseLong(referenceOffset.get(SourceInfo.LSN_KEY)))
+                                .asString();
+            }
+            statement.setString(1, Lsn.valueOf(endOffset).asString());
+            statement.setString(2, currentOffset);
+            statement.setString(3, slotName);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    throw new SQLException("Replication slot not found: " + slotName);
+                }
+                long lagBytes = resultSet.getLong(1);
+                if (resultSet.wasNull()) {
+                    throw new SQLException(
+                            "Replication slot has no confirmed flush LSN: " + slotName);
+                }
+                return lagBytes >= 0 ? lagBytes : -1;
+            }
         }
     }
 
@@ -583,29 +624,6 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
         }
     }
 
-    /**
-     * Fetch the current schema for a single table directly from PostgreSQL via JDBC.
-     *
-     * <p>Called by {@link PostgresDebeziumJsonDeserializer} when a schema change (ADD/DROP column)
-     * is detected, to obtain accurate PG column types for DDL generation.
-     *
-     * @return the fresh {@link TableChanges.TableChange}
-     */
-    private TableChanges.TableChange refreshSingleTableSchema(
-            TableId tableId, Map<String, String> config, String jobId) {
-        PostgresSourceConfig sourceConfig = generatePostgresConfig(config, jobId, 0);
-        PostgresDialect dialect = new PostgresDialect(sourceConfig);
-        try (JdbcConnection jdbcConnection = dialect.openJdbcConnection(sourceConfig)) {
-            CustomPostgresSchema customPostgresSchema =
-                    new CustomPostgresSchema((PostgresConnection) jdbcConnection, sourceConfig);
-            Map<TableId, TableChanges.TableChange> schemas =
-                    customPostgresSchema.getTableSchema(Collections.singletonList(tableId));
-            return schemas.get(tableId);
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
     @Override
     protected FetchTask<SourceSplitBase> createFetchTaskFromSplit(
             JobBaseConfig jobConfig, SourceSplitBase split) {
@@ -690,11 +708,12 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
                     jobId);
             return true;
         }
-        PostgresDialect dialect = new PostgresDialect(getSourceConfig(jobConfig));
+        JdbcConfiguration jdbcConfig =
+                getSourceConfig(jobConfig).getDbzConnectorConfig().getJdbcConfig();
         boolean cleaned = true;
         if (dropPub) {
             LOG.info("Dropping auto-created publication {} for job {}", pubName, jobId);
-            try (PostgresConnection connection = dialect.openJdbcConnection()) {
+            try (PostgresConnection connection = createCleanupConnection(jdbcConfig)) {
                 connection.execute("DROP PUBLICATION IF EXISTS " + pubName);
             } catch (Exception ex) {
                 LOG.warn(
@@ -703,7 +722,7 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
                         jobId,
                         ex.getMessage());
             }
-            if (publicationExists(dialect, pubName)) {
+            if (publicationExists(jdbcConfig, pubName)) {
                 LOG.warn(
                         "Publication {} for job {} still present after drop, will retry",
                         pubName,
@@ -713,8 +732,8 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
         }
         if (dropSlot) {
             LOG.info("Dropping auto-created replication slot {} for job {}", slotName, jobId);
-            try {
-                dialect.removeSlot(slotName);
+            try (PostgresConnection connection = createCleanupConnection(jdbcConfig)) {
+                connection.dropReplicationSlot(slotName);
             } catch (Exception ex) {
                 LOG.warn(
                         "Drop of replication slot {} for job {} failed: {}",
@@ -722,7 +741,7 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
                         jobId,
                         ex.getMessage());
             }
-            if (slotExists(dialect, slotName)) {
+            if (slotExists(jdbcConfig, slotName)) {
                 LOG.warn(
                         "Replication slot {} for job {} still present after drop, will retry",
                         slotName,
@@ -733,8 +752,12 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
         return cleaned;
     }
 
-    private boolean slotExists(PostgresDialect dialect, String slotName) {
-        try (PostgresConnection connection = dialect.openJdbcConnection()) {
+    static PostgresConnection createCleanupConnection(JdbcConfiguration jdbcConfig) {
+        return new PostgresConnection(jdbcConfig, PostgresConnection.CONNECTION_GENERAL);
+    }
+
+    private boolean slotExists(JdbcConfiguration jdbcConfig, String slotName) {
+        try (PostgresConnection connection = createCleanupConnection(jdbcConfig)) {
             return connection.queryAndMap(
                     "SELECT 1 FROM pg_replication_slots WHERE slot_name = '" + slotName + "'",
                     rs -> rs.next());
@@ -747,8 +770,8 @@ public class PostgresSourceReader extends JdbcIncrementalSourceReader {
         }
     }
 
-    private boolean publicationExists(PostgresDialect dialect, String pubName) {
-        try (PostgresConnection connection = dialect.openJdbcConnection()) {
+    private boolean publicationExists(JdbcConfiguration jdbcConfig, String pubName) {
+        try (PostgresConnection connection = createCleanupConnection(jdbcConfig)) {
             return connection.queryAndMap(
                     "SELECT 1 FROM pg_publication WHERE pubname = '" + pubName + "'",
                     rs -> rs.next());
